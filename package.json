@@ -1,0 +1,10 @@
+{
+  "name": "voice-service",
+  "version": "1.0.0",
+  "description": "Веб-сервис для отладки микрофона в локальной сети (PulseAudio/parec -> SSE -> браузер)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "private": true
+}

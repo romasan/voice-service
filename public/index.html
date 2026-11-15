@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Отладка микрофона — node1</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main class="card">
+  <header class="head">
+    <h1>Микрофон <span class="dot" id="live-dot" title="нет данных"></span></h1>
+    <div class="sub" id="subtitle">подключение…</div>
+  </header>
+
+  <div class="controls">
+    <select id="source" title="Источник записи"></select>
+    <label class="gain" title="Усиление для отображения">
+      <span>×<b id="gain-val">4</b></span>
+      <input type="range" id="gain" min="1" max="32" step="1" value="4">
+    </label>
+  </div>
+
+  <div class="viz">
+    <canvas id="wave" width="1600" height="420"></canvas>
+    <div class="meter">
+      <div class="meter-bar"><i id="meter-fill"></i><i id="meter-peak"></i></div>
+      <div class="meter-labels"><span id="db-now">−∞ dBFS</span><span id="db-peak">пик −∞</span></div>
+    </div>
+    <canvas id="scope" width="1600" height="200" class="scope"></canvas>
+  </div>
+
+  <div class="buttons">
+    <button id="rec" class="btn rec"><span class="ico"></span><span id="rec-label">Record</span></button>
+    <button id="play" class="btn play" disabled><span class="ico"></span><span>Play</span></button>
+    <span class="recinfo" id="recinfo"></span>
+  </div>
+
+  <div class="list">
+    <div class="list-head">Записи <span id="count"></span></div>
+    <ul id="recordings"></ul>
+  </div>
+  <section class="sec">
+    <h2>Голосовой ввод <span class="hint" id="asr-model-info">Vosk</span></h2>
+    <div class="row">
+      <button id="asr-toggle" class="btn small" type="button">Включить распознавание</button>
+      <span id="asr-badge" class="badge off">выкл</span>
+      <span class="muted small">распознавание идёт на сервере, микрофон тот же</span>
+    </div>
+    <div class="asr-live">
+      <div class="asr-partial" id="asr-partial">—</div>
+      <div class="asr-hint" id="asr-hint">скажите «Антон», затем команду</div>
+    </div>
+    <form id="asr-form" class="formgrid">
+      <label>Слово-обращение
+        <input id="asr-wake" type="text" placeholder="антон" autocomplete="off" spellcheck="false">
+      </label>
+      <label>Модель
+        <select id="asr-model"></select>
+      </label>
+      <label>Пауза, мс
+        <input id="asr-silence" type="number" min="300" max="5000" step="100" value="1200">
+      </label>
+      <label class="chk">
+        <input id="asr-require" type="checkbox" checked>
+        <span>только после обращения</span>
+      </label>
+      <button type="submit" class="btn small">Сохранить</button>
+      <span id="asr-saved" class="muted small"></span>
+    </form>
+    <div class="hist-head">
+      <span>История ввода</span>
+      <button id="hist-clear" class="link" type="button">очистить</button>
+    </div>
+    <ul id="hist" class="hist"></ul>
+  </section>
+
+  <section class="sec">
+    <h2>Голосовой вывод <span class="hint">eSpeak NG / RHVoice</span></h2>
+    <form id="tts-form">
+      <textarea id="tts-text" rows="2" placeholder="Текст, который проговорит динамик сервера…"></textarea>
+      <div class="engines" role="radiogroup" aria-label="Движок синтеза">
+        <label class="seg"><input type="radio" name="tts-engine" value="espeak" checked><span>eSpeak NG</span></label>
+        <label class="seg"><input type="radio" name="tts-engine" value="rhvoice"><span>RHVoice</span></label>
+        <span id="engine-note" class="muted small"></span>
+      </div>
+      <div class="formgrid tts-row">
+        <label>Голос
+          <select id="tts-voice"></select>
+        </label>
+      </div>
+      <div id="params-espeak" class="formgrid tts-row">
+        <label>Скорость
+          <span class="range"><input id="tts-speed" type="range" min="80" max="450" step="5" value="150"><b id="tts-speed-v">150</b></span>
+        </label>
+        <label>Тон
+          <span class="range"><input id="tts-pitch" type="range" min="0" max="99" value="50"><b id="tts-pitch-v">50</b></span>
+        </label>
+        <label>Громкость
+          <span class="range"><input id="tts-amp" type="range" min="0" max="200" step="5" value="100"><b id="tts-amp-v">100</b></span>
+        </label>
+      </div>
+      <div id="params-rhvoice" class="formgrid tts-row" hidden>
+        <label>Темп, %
+          <span class="range"><input id="rhv-rate" type="range" min="50" max="200" step="5" value="100"><b id="rhv-rate-v">100</b></span>
+        </label>
+        <label>Тон, %
+          <span class="range"><input id="rhv-pitch" type="range" min="50" max="200" step="5" value="100"><b id="rhv-pitch-v">100</b></span>
+        </label>
+        <label>Громкость, %
+          <span class="range"><input id="rhv-vol" type="range" min="0" max="100" step="5" value="100"><b id="rhv-vol-v">100</b></span>
+        </label>
+      </div>
+      <div class="row">
+        <button class="btn small" type="submit">Проговорить</button>
+        <button class="btn small" type="button" id="tts-save" title="Запомнить выбранный движок, голос и параметры">Сохранить</button>
+        <span id="tts-info" class="muted small"></span>
+        <audio id="tts-player" controls class="tts-audio" hidden></audio>
+      </div>
+    </form>
+  </section>
+
+</main>
+<audio id="player" preload="none"></audio>
+<script src="/app.js"></script>
+</body>
+</html>
