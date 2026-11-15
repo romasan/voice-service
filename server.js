@@ -352,10 +352,12 @@ const os = require('os');
 const CFG_PATH = path.join(DATA_DIR, 'config.json');
 const HIST_PATH = path.join(DATA_DIR, 'history.json');
 const PYTHON = process.env.PYTHON || (fs.existsSync('/home/r/bin/python3') ? '/home/r/bin/python3' : 'python3');
+const VAD_MODEL = process.env.VAD_MODEL || path.join(os.homedir(), '.local/opt/silero-vad/silero_vad.onnx');
+function vadAvailable() { return fs.existsSync(VAD_MODEL); }
 
 function defaultCfg() {
   return {
-    asr: { model: '', wakeWord: 'антон', requireWake: true, silenceMs: 1200 },
+    asr: { model: '', wakeWord: 'антон', requireWake: true, silenceMs: 1200, vad: true, vadThreshold: 0.5 },
     tts: {
       engine: 'espeak',
       espeak: { voice: 'ru', speed: 150, pitch: 50, amplitude: 100 },
@@ -518,6 +520,8 @@ function asrState() {
     armed: asr.armed,
     partial: asr.partial,
     error: asr.error,
+    speaking: !!asr.speaking,
+    vad: !!cfg.asr.vad && vadAvailable(),
   };
 }
 
@@ -537,7 +541,11 @@ function startAsr() {
     asr.error = 'не найден ' + worker;
     return;
   }
-  const proc = spawn(PYTHON, [worker, '--model', m.path, '--rate', String(RATE)], {
+  const args = [worker, '--model', m.path, '--rate', String(RATE)];
+  if (cfg.asr.vad && vadAvailable()) {
+    args.push('--vad', VAD_MODEL, '--vad-threshold', String(clamp(cfg.asr.vadThreshold, 0.05, 0.95)));
+  }
+  const proc = spawn(PYTHON, args, {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: process.env,
   });
@@ -594,6 +602,11 @@ function handleAsrLine(line) {
   if (msg.type === 'error') {
     asr.error = msg.error;
     broadcast('asr', { state: 'error', error: msg.error });
+    return;
+  }
+  if (msg.type === 'vad') {
+    asr.speaking = !!msg.speech;
+    broadcast('asr', { type: 'vad', speech: asr.speaking, prob: msg.prob, enabled: asr.enabled, ready: asr.ready, armed: asr.armed });
     return;
   }
   if (msg.type === 'partial') {
@@ -1287,6 +1300,7 @@ const server = http.createServer((req, res) => {
     if (p === '/api/asr/options') {
       return sendJson(res, {
         models: listModels(),
+        vad: { available: vadAvailable(), path: VAD_MODEL },
         config: cfg.asr,
         state: asrState(),
         history: history.items.slice(0, 20),
@@ -1323,9 +1337,11 @@ const server = http.createServer((req, res) => {
         if (body.wakeWord !== undefined) a.wakeWord = String(body.wakeWord).slice(0, 64);
         if (body.requireWake !== undefined) a.requireWake = !!body.requireWake;
         if (body.silenceMs !== undefined) a.silenceMs = clamp(body.silenceMs, 300, 5000);
+        if (body.vad !== undefined) a.vad = !!body.vad;
+        if (body.vadThreshold !== undefined) a.vadThreshold = clamp(body.vadThreshold, 0.05, 0.95);
         saveCfg();
-        const modelChanged = body.model !== undefined;
-        if (asr.enabled) {
+        const modelChanged = body.model !== undefined || body.vad !== undefined || body.vadThreshold !== undefined;
+        if (asr.enabled && modelChanged) {
           stopAsr();
           startAsr();
         }

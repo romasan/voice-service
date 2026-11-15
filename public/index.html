@@ -46,6 +46,7 @@
     <div class="row">
       <button id="asr-toggle" class="btn small" type="button">Включить распознавание</button>
       <span id="asr-badge" class="badge off">выкл</span>
+      <span id="asr-vad-badge" class="badge off" hidden>тишина</span>
       <span class="muted small">распознавание идёт на сервере, микрофон тот же</span>
     </div>
     <div class="asr-live">
@@ -65,6 +66,13 @@
       <label class="chk">
         <input id="asr-require" type="checkbox" checked>
         <span>только после обращения</span>
+      </label>
+      <label class="chk" title="Silero VAD отрезает тишину и шум, в Vosk уходит только речь">
+        <input id="asr-vad" type="checkbox" checked>
+        <span>Silero VAD</span>
+      </label>
+      <label>Порог VAD
+        <input id="asr-vad-th" type="number" min="0.05" max="0.95" step="0.05" value="0.5">
       </label>
       <button type="submit" class="btn small">Сохранить</button>
       <span id="asr-saved" class="muted small"></span>

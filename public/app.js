@@ -204,6 +204,12 @@
     es.addEventListener('asr', (e) => {
       const d = JSON.parse(e.data);
       applyAsrState(d);
+      if (d.type === 'vad') {
+        asrUi.speaking = !!d.speech;
+        applyVadBadge(asrUi.speaking);
+        if (asrUi.speaking) hintEl.textContent = 'слышу речь…';
+        return;
+      }
       if (d.type === 'partial') {
         partialEl.textContent = d.text || '…';
         if (d.enabled) hintEl.textContent = 'распознаю…';
@@ -350,7 +356,7 @@
 
 
   /* ---------- голосовой ввод (Vosk) ---------- */
-  const asrUi = { enabled: false, ready: false, armed: false, error: null };
+  const asrUi = { enabled: false, ready: false, armed: false, error: null, vad: true, speaking: false };
   const wakeInput = $('asr-wake');
   const partialEl = $('asr-partial');
   const hintEl = $('asr-hint');
@@ -362,6 +368,15 @@
   function hintIdle() {
     if (!asrUi.enabled) { hintEl.textContent = 'распознавание выключено'; return; }
     hintEl.textContent = 'скажите «' + wakeWord() + '», затем команду';
+  }
+
+  function applyVadBadge(speaking) {
+    const el = $('asr-vad-badge');
+    if (!el) return;
+    if (!asrUi.enabled || !asrUi.vad) { el.hidden = true; return; }
+    el.hidden = false;
+    el.className = 'badge ' + (speaking ? 'ready' : 'off');
+    el.textContent = speaking ? 'речь' : 'тишина';
   }
 
   function applyAsrBadge() {
@@ -386,6 +401,9 @@
     if (d.ready !== undefined) asrUi.ready = d.ready;
     if (d.armed !== undefined) asrUi.armed = d.armed;
     if (d.model) $('asr-model-info').textContent = 'Vosk · ' + d.model;
+    if (d.vad !== undefined) asrUi.vad = !!d.vad;
+    if (d.speaking !== undefined) asrUi.speaking = !!d.speaking;
+    applyVadBadge(asrUi.speaking);
     applyAsrBadge();
   }
 
@@ -463,6 +481,13 @@
         wakeInput.value = d.config.wakeWord || '';
         $('asr-silence').value = d.config.silenceMs || 1200;
         $('asr-require').checked = d.config.requireWake !== false;
+        $('asr-vad').checked = d.config.vad !== false;
+        $('asr-vad-th').value = d.config.vadThreshold != null ? d.config.vadThreshold : 0.5;
+        if (d.vad && !d.vad.available) {
+          $('asr-vad').checked = false;
+          $('asr-vad').disabled = true;
+          $('asr-vad').parentElement.title = 'модель Silero VAD не найдена на сервере';
+        }
       }
       applyAsrState(d.state);
       renderHistory(d.history || []);
@@ -479,7 +504,7 @@
       const r = await fetch(on ? '/api/asr/start' : '/api/asr/stop', { method: 'POST' });
       const d = await r.json();
       applyAsrState(d.state);
-      if (!on) { partialEl.textContent = '—'; hintIdle(); }
+      if (!on) { partialEl.textContent = '—'; asrUi.speaking = false; applyVadBadge(false); $('asr-vad-badge').hidden = true; hintIdle(); }
       else hintEl.textContent = 'загрузка модели…';
     } catch (e) {
       hintEl.textContent = 'ошибка: ' + e.message;
@@ -495,6 +520,8 @@
       wakeWord: wakeInput.value.trim(),
       requireWake: $('asr-require').checked,
       silenceMs: Number($('asr-silence').value) || 1200,
+      vad: $('asr-vad').checked,
+      vadThreshold: Number($('asr-vad-th').value) || 0.5,
     };
     try {
       const r = await fetch('/api/asr/config', {
