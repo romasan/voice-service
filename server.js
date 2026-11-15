@@ -919,6 +919,126 @@ function readBody(req, cb, limit) {
   req.on('error', (e) => cb(e));
 }
 
+/* ---------- системный звук (PulseAudio + ALSA) ---------- */
+const { execFileSync } = require('child_process');
+
+function pactlJson(args) {
+  const out = execFileSync('pactl', ['--format=json'].concat(args), { timeout: 8000, maxBuffer: 1 << 22 });
+  return JSON.parse(out.toString());
+}
+
+function pulseVolume(vol) {
+  if (!vol) return 100;
+  const first = Object.values(vol)[0];
+  if (!first) return 100;
+  if (first.value_percent) return Math.round(parseFloat(first.value_percent));
+  return Math.round((first.value / 65536) * 100);
+}
+
+function prettyDevice(name) {
+  if (/bluez/.test(name)) return 'Bluetooth';
+  if (/usb/i.test(name)) return 'USB-устройство';
+  if (/pci-/.test(name)) {
+    let label = 'Встроенная карта';
+    if (/analog/.test(name)) label += ' · аналог';
+    else if (/iec958|hdmi/.test(name)) label += ' · цифровой';
+    return label;
+  }
+  return name;
+}
+
+function amixerControls(card) {
+  const controls = [];
+  let out;
+  try {
+    out = execFileSync('amixer', ['-c', String(card), 'scontrols'], { timeout: 5000 }).toString();
+  } catch (e) {
+    return controls;
+  }
+  const names = Array.from(out.matchAll(/'([^']+)'/g), (m) => m[1]);
+  for (const nm of names) {
+    if (!/mic|gain|capture|boost/i.test(nm)) continue;
+    let txt;
+    try {
+      txt = execFileSync('amixer', ['-c', String(card), 'sget', nm], { timeout: 5000 }).toString();
+    } catch (e) { continue; }
+    const lim = txt.match(/Limits:\s+\S+\s+(-?\d+)\s+-\s+(-?\d+)/);
+    if (lim) {
+      const val = txt.match(/(?:Mono|Front Left|Capture):\s*(?:\S+\s+)?(-?\d+)\s*\[/);
+      if (val) {
+        controls.push({ id: nm, kind: 'int', min: Number(lim[1]), max: Number(lim[2]), value: Number(val[1]) });
+        continue;
+      }
+    }
+    if (/\[(on|off)\]/i.test(txt)) {
+      controls.push({ id: nm, kind: 'bool', value: /\[on\]/i.test(txt) });
+    }
+  }
+  return controls;
+}
+
+function audioState(sourceName) {
+  const sinks = pactlJson(['list', 'sinks']).map((s) => ({
+    name: s.name,
+    label: prettyDevice(s.name),
+    volume: pulseVolume(s.volume),
+    mute: !!s.mute,
+    monitor: false,
+  }));
+  const sources = pactlJson(['list', 'sources'])
+    .filter((s) => !s.name.endsWith('.monitor'))
+    .map((s) => ({
+      name: s.name,
+      label: prettyDevice(s.name),
+      volume: pulseVolume(s.volume),
+      mute: !!s.mute,
+      card: s.properties && s.properties['alsa.card'] ? Number(s.properties['alsa.card']) : null,
+    }));
+  const defaultSink = execFileSync('pactl', ['get-default-sink'], { timeout: 5000 }).toString().trim();
+  const defaultSource = execFileSync('pactl', ['get-default-source'], { timeout: 5000 }).toString().trim();
+  const target = sourceName || defaultSource;
+  const src = sources.find((s) => s.name === target) || sources[0];
+  const card = src && src.card != null ? { index: src.card, controls: amixerControls(src.card) } : null;
+  return { sinks, sources, defaultSink, defaultSource, card };
+}
+
+function audioSet(kind, body) {
+  const isSink = kind === 'sink';
+  const name = String(body.name || '');
+  if (!name) return { error: 'не указано устройство' };
+  if (body.volume != null) {
+    const v = clamp(body.volume, 0, 150);
+    execFileSync('pactl', [isSink ? 'set-sink-volume' : 'set-source-volume', name, v + '%'], { timeout: 5000 });
+  }
+  if (body.mute != null) {
+    execFileSync('pactl', [isSink ? 'set-sink-mute' : 'set-source-mute', name, body.mute ? '1' : '0'], { timeout: 5000 });
+  }
+  if (body.setDefault) {
+    execFileSync('pactl', [isSink ? 'set-default-sink' : 'set-default-source', name], { timeout: 5000 });
+  }
+  return { ok: true };
+}
+
+function cardSet(card, control, value) {
+  const idx = String(Number(card));
+  if (idx === 'NaN' || !control) return { error: 'неверная карта или контрол' };
+  const val = typeof value === 'boolean' ? (value ? 'on' : 'off') : String(Number(value));
+  if (val === 'NaN') return { error: 'неверное значение' };
+  execFileSync('amixer', ['-c', idx, 'sset', String(control), val], { timeout: 5000 });
+  return { ok: true };
+}
+
+function playTestTone(sink, cb) {
+  const file = path.join(TTS_DIR, 'test-tone.wav');
+  execFile('ffmpeg', ['-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'sine=frequency=660:duration=0.7', '-af', 'volume=0.35', '-ar', '44100', file], { timeout: 15000 }, (err) => {
+    if (err) return cb(err);
+    const args = sink ? ['--device=' + sink, file] : [file];
+    const proc = spawn('paplay', args, { stdio: 'ignore' });
+    proc.on('error', (e) => cb(e));
+    proc.on('exit', (code) => cb(code === 0 ? null : new Error('paplay exit ' + code)));
+  });
+}
+
 /* ---------- HTTP ---------- */
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://' + (req.headers.host || 'localhost'));
@@ -1036,6 +1156,46 @@ const server = http.createServer((req, res) => {
         saveHistory();
         broadcast('history', { cleared: false });
         sendJson(res, { ok: true });
+      });
+    }
+    if (p === '/api/audio') {
+      try {
+        return sendJson(res, audioState(u.searchParams.get('source')));
+      } catch (e) {
+        return sendJson(res, { error: 'pactl: ' + e.message }, 500);
+      }
+    }
+    if (p === '/api/audio/sink' || p === '/api/audio/source') {
+      return readBody(req, (err, body) => {
+        if (err) return sendJson(res, { error: 'bad json' }, 400);
+        try {
+          const r = audioSet(p.endsWith('sink') ? 'sink' : 'source', body);
+          if (r.error) return sendJson(res, r, 400);
+          sendJson(res, { ok: true, state: audioState(body.source || null) });
+        } catch (e) {
+          sendJson(res, { error: e.message }, 500);
+        }
+      });
+    }
+    if (p === '/api/audio/card') {
+      return readBody(req, (err, body) => {
+        if (err) return sendJson(res, { error: 'bad json' }, 400);
+        try {
+          const r = cardSet(body.card, body.control, body.value);
+          if (r.error) return sendJson(res, r, 400);
+          sendJson(res, { ok: true, state: audioState(body.source || null) });
+        } catch (e) {
+          sendJson(res, { error: e.message }, 500);
+        }
+      });
+    }
+    if (p === '/api/audio/test') {
+      return readBody(req, (err, body) => {
+        if (err) return sendJson(res, { error: 'bad json' }, 400);
+        playTestTone(body.sink || null, (terr) => {
+          if (terr) return sendJson(res, { error: terr.message }, 500);
+          sendJson(res, { ok: true });
+        });
       });
     }
     if (p === '/api/tts/options') {

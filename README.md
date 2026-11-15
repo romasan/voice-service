@@ -124,6 +124,26 @@ pm2: `pm2 start server.js --name voice-service`, автозапуск — чер
 SSE дополнительно отдаёт события `asr` (partial/final/wake/ignored/idle/error), `cmd` (распознанная
 команда), `history`, `tts`. В `hello` теперь приходят состояние ASR и последние фразы.
 
+### Системный звук
+
+Секция «Системный звук» управляет тем же PulseAudio/ALSA, что использует сервис, — без ssh.
+
+- **Вывод**: выбор sink, громкость 0–150 %, mute, «По умолчанию», «Проверить» (короткий тон 660 Гц
+  через `paplay --device=<sink>`; если sink в mute, страница об этом предупредит).
+- **Ввод**: выбор source, громкость, mute, «По умолчанию» + аппаратные контролы ALSA той карты,
+  к которой относится выбранный source (у USB-микрофона это `Mic` 0–16 и `Auto Gain Control`).
+  Поэтому лечить «тихий микрофон» можно прямо из браузера, не заходя в `alsamixer`.
+- Состояние читается из `pactl --format=json list sinks|sources` + `amixer sget`; меняется через
+  `pactl set-sink-*` / `set-source-*` / `amixer sset`. В конфиг сервиса ничего не пишется —
+  это состояние звуковой подсистемы.
+
+| Метод | Путь | Назначение |
+|---|---|---|
+| GET | `/api/audio?source=NAME` | sinks, sources, default'ы и ALSA-контролы карты источника |
+| POST | `/api/audio/sink` `/api/audio/source` | `{name, volume?, mute?, setDefault?}` |
+| POST | `/api/audio/card` | `{card, control, value}` → `amixer sset` |
+| POST | `/api/audio/test` | `{sink?}` → короткий тон |
+
 ## Проверено
 
 - Запись 5 с → WAV ровно 5.000 с; Play в браузере работает.

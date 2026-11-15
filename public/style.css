@@ -152,3 +152,22 @@ textarea { resize: vertical; min-height: 52px; }
 .seg.disabled { opacity: .45; cursor: not-allowed; }
 
 [hidden] { display: none !important; }
+
+.audio-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+.audio-block { background: var(--panel2); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+.audio-head { font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.audio-block label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--muted); }
+.audio-block .row { margin-top: 2px; }
+.card-controls { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+.card-controls:empty { display: none; }
+.card-ctl label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--muted); }
+.card-ctl label.chk { flex-direction: row; align-items: center; gap: 8px; color: var(--text); font-size: 12.5px; }
+.card-ctl .range { display: flex; align-items: center; gap: 8px; }
+.card-ctl .range input[type=range] { flex: 1; accent-color: var(--accent); }
+.card-ctl .range b { color: var(--text); font-variant-numeric: tabular-nums; min-width: 22px; text-align: right; }
+#audio-info { margin-top: 10px; min-height: 16px; }
+
+.audio-block select { flex: 0 0 auto; height: 36px; min-width: 0; }
+.audio-block label.chk { flex-direction: row; align-items: center; gap: 8px; color: var(--text); font-size: 12.5px; }
+.audio-block label.chk input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--accent); margin: 0; }
+.audio-block .row { align-items: center; }

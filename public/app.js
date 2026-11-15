@@ -699,6 +699,177 @@
     }
   });
 
+  /* ---------- системный звук ---------- */
+  const audioUi = { sinks: [], sources: [], card: null, sinkTimer: null, sourceTimer: null };
+
+  function fillDevices(sel, items, defaultName) {
+    const prev = sel.value;
+    sel.innerHTML = '';
+    for (const it of items) {
+      const o = document.createElement('option');
+      o.value = it.name;
+      o.textContent = it.label + (it.name === defaultName ? ' · по умолчанию' : '');
+      sel.appendChild(o);
+    }
+    if (prev && items.some((i) => i.name === prev)) sel.value = prev;
+    else if (defaultName && items.some((i) => i.name === defaultName)) sel.value = defaultName;
+    else if (items.length) sel.value = items[0].name;
+  }
+
+  function applySink(name) {
+    const s = audioUi.sinks.find((x) => x.name === name);
+    if (!s) return;
+    $('sink-vol').value = s.volume;
+    $('sink-vol-v').textContent = s.volume;
+    $('sink-mute').checked = s.mute;
+  }
+
+  function applySource(name) {
+    const s = audioUi.sources.find((x) => x.name === name);
+    if (!s) return;
+    $('source-vol').value = s.volume;
+    $('source-vol-v').textContent = s.volume;
+    $('source-mute').checked = s.mute;
+  }
+
+  function renderCardControls(card) {
+    const box = $('card-controls');
+    box.innerHTML = '';
+    audioUi.card = card;
+    if (!card || !card.controls || !card.controls.length) return;
+    for (const c of card.controls) {
+      const wrap = document.createElement('div');
+      wrap.className = 'card-ctl';
+      if (c.kind === 'int') {
+        const label = document.createElement('label');
+        const title = document.createElement('span');
+        title.textContent = c.id + ' (ALSA)';
+        const range = document.createElement('span');
+        range.className = 'range';
+        const input = document.createElement('input');
+        input.type = 'range';
+        input.min = c.min;
+        input.max = c.max;
+        input.value = c.value;
+        const out = document.createElement('b');
+        out.textContent = c.value;
+        input.addEventListener('input', () => { out.textContent = input.value; });
+        input.addEventListener('change', () => postCard(card.index, c.id, Number(input.value)));
+        range.appendChild(input);
+        range.appendChild(out);
+        label.appendChild(title);
+        label.appendChild(range);
+        wrap.appendChild(label);
+      } else {
+        const label = document.createElement('label');
+        label.className = 'chk';
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.checked = !!c.value;
+        input.addEventListener('change', () => postCard(card.index, c.id, input.checked));
+        const span = document.createElement('span');
+        span.textContent = c.id + ' (ALSA)';
+        label.appendChild(input);
+        label.appendChild(span);
+        wrap.appendChild(label);
+      }
+      box.appendChild(wrap);
+    }
+  }
+
+  async function loadAudio(sourceName) {
+    const q = sourceName || $('source-select').value || $('source').value || '';
+    try {
+      const r = await fetch('/api/audio' + (q ? '?source=' + encodeURIComponent(q) : ''), { cache: 'no-store' });
+      const d = await r.json();
+      if (d.error) { $('audio-info').textContent = d.error; return; }
+      audioUi.sinks = d.sinks || [];
+      audioUi.sources = d.sources || [];
+      fillDevices($('sink-select'), audioUi.sinks, d.defaultSink);
+      fillDevices($('source-select'), audioUi.sources, d.defaultSource);
+      if (q && audioUi.sources.some((s) => s.name === q)) $('source-select').value = q;
+      applySink($('sink-select').value);
+      applySource($('source-select').value);
+      renderCardControls(d.card);
+    } catch (e) {
+      $('audio-info').textContent = 'не удалось прочитать состояние звука: ' + e.message;
+    }
+  }
+
+  async function postAudio(path, body, okText) {
+    try {
+      const r = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const d = await r.json();
+      if (d.error) { $('audio-info').textContent = d.error; return null; }
+      $('audio-info').textContent = okText || '';
+      return d;
+    } catch (e) {
+      $('audio-info').textContent = 'ошибка: ' + e.message;
+      return null;
+    }
+  }
+
+  function postCard(card, control, value) {
+    postAudio('/api/audio/card', { card, control, value, source: $('source-select').value }, 'применено: ' + control);
+  }
+
+  $('sink-select').addEventListener('change', () => {
+    applySink($('sink-select').value);
+    $('audio-info').textContent = '';
+  });
+
+  $('source-select').addEventListener('change', () => {
+    applySource($('source-select').value);
+    loadAudio($('source-select').value);
+  });
+
+  $('sink-vol').addEventListener('input', () => {
+    $('sink-vol-v').textContent = $('sink-vol').value;
+    clearTimeout(audioUi.sinkTimer);
+    audioUi.sinkTimer = setTimeout(() => {
+      postAudio('/api/audio/sink', { name: $('sink-select').value, volume: Number($('sink-vol').value) });
+    }, 180);
+  });
+
+  $('source-vol').addEventListener('input', () => {
+    $('source-vol-v').textContent = $('source-vol').value;
+    clearTimeout(audioUi.sourceTimer);
+    audioUi.sourceTimer = setTimeout(() => {
+      postAudio('/api/audio/source', { name: $('source-select').value, volume: Number($('source-vol').value) });
+    }, 180);
+  });
+
+  $('sink-mute').addEventListener('change', () => {
+    postAudio('/api/audio/sink', { name: $('sink-select').value, mute: $('sink-mute').checked },
+      $('sink-mute').checked ? 'вывод выключен (mute)' : 'вывод включён');
+  });
+
+  $('source-mute').addEventListener('change', () => {
+    postAudio('/api/audio/source', { name: $('source-select').value, mute: $('source-mute').checked },
+      $('source-mute').checked ? 'ввод выключен (mute)' : 'ввод включён');
+  });
+
+  $('sink-default').addEventListener('click', async () => {
+    const d = await postAudio('/api/audio/sink', { name: $('sink-select').value, setDefault: true }, 'устройство вывода по умолчанию обновлено');
+    if (d && d.state) fillDevices($('sink-select'), d.state.sinks, d.state.defaultSink);
+  });
+
+  $('source-default').addEventListener('click', async () => {
+    const d = await postAudio('/api/audio/source', { name: $('source-select').value, setDefault: true }, 'устройство ввода по умолчанию обновлено');
+    if (d && d.state) fillDevices($('source-select'), d.state.sources, d.state.defaultSource);
+  });
+
+  $('sink-test').addEventListener('click', async () => {
+    $('audio-info').textContent = 'проигрываю тон…';
+    const muted = $('sink-mute').checked;
+    const hint = muted ? 'тон проигран, но вывод в mute — снимите mute, чтобы услышать' : 'тон проигран';
+    await postAudio('/api/audio/test', { sink: $('sink-select').value }, hint);
+  });
+
   /* ---------- старт ---------- */
   async function init() {
     fitCanvases();
@@ -716,10 +887,11 @@
       const usb = srcs.find((s) => /usb/i.test(s.name));
       const pick = usb ? usb.name : (srcs[0] && srcs[0].name);
       if (pick) sourceSel.value = pick;
-      sourceSel.addEventListener('change', () => connect(sourceSel.value));
+      sourceSel.addEventListener('change', () => { connect(sourceSel.value); loadAudio(sourceSel.value); });
       await refreshRecordings();
       await loadAsr();
       await loadTts();
+      await loadAudio(pick);
       connect(pick);
     } catch (e) {
       subtitle.textContent = 'ошибка подключения: ' + e.message;

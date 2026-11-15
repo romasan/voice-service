@@ -121,6 +121,42 @@
     </form>
   </section>
 
+  <section class="sec">
+    <h2>Системный звук <span class="hint" id="audio-hint">PulseAudio · node1</span></h2>
+    <div class="audio-grid">
+      <div class="audio-block">
+        <div class="audio-head">Вывод</div>
+        <label>Устройство
+          <select id="sink-select"></select>
+        </label>
+        <label>Громкость
+          <span class="range"><input id="sink-vol" type="range" min="0" max="150" step="1" value="100"><b id="sink-vol-v">100</b></span>
+        </label>
+        <div class="row">
+          <label class="chk"><input id="sink-mute" type="checkbox"><span>mute</span></label>
+          <button class="btn small" id="sink-default" type="button">По умолчанию</button>
+          <button class="btn small" id="sink-test" type="button">Проверить</button>
+        </div>
+      </div>
+
+      <div class="audio-block">
+        <div class="audio-head">Ввод</div>
+        <label>Устройство
+          <select id="source-select"></select>
+        </label>
+        <label>Громкость
+          <span class="range"><input id="source-vol" type="range" min="0" max="150" step="1" value="100"><b id="source-vol-v">100</b></span>
+        </label>
+        <div class="row">
+          <label class="chk"><input id="source-mute" type="checkbox"><span>mute</span></label>
+          <button class="btn small" id="source-default" type="button">По умолчанию</button>
+        </div>
+        <div id="card-controls" class="card-controls"></div>
+      </div>
+    </div>
+    <div class="muted small" id="audio-info"></div>
+  </section>
+
 </main>
 <audio id="player" preload="none"></audio>
 <script src="/app.js"></script>
