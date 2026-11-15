@@ -80,7 +80,6 @@ select:focus { border-color: var(--accent); }
 .btn .ico { width: 12px; height: 12px; border-radius: 50%; background: var(--rec); display: inline-block; }
 .btn.rec.on { background: rgba(239,68,68,.12); border-color: rgba(239,68,68,.55); }
 .btn.rec.on .ico { border-radius: 2px; animation: pulse 1.2s infinite; }
-.btn.play .ico { width: 0; height: 0; border-radius: 0; background: none; border-left: 12px solid var(--accent); border-top: 7px solid transparent; border-bottom: 7px solid transparent; }
 @keyframes pulse { 50% { opacity: .35; } }
 .recinfo { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
 .list { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
@@ -196,3 +195,15 @@ textarea { resize: vertical; min-height: 52px; }
 .llm-model-label { grid-column: span 2; }
 #llm-model { width: 100%; }
 @media (max-width: 640px) { .llm-model-label { grid-column: span 1; } }
+
+#recordings .play-mini {
+  flex: 0 0 auto; width: 26px; height: 26px; border-radius: 50%;
+  border: 1px solid var(--line); background: var(--panel2); cursor: pointer;
+  position: relative; padding: 0;
+}
+#recordings .play-mini::after {
+  content: ''; position: absolute; left: 9px; top: 6px;
+  border-left: 9px solid var(--accent);
+  border-top: 6px solid transparent; border-bottom: 6px solid transparent;
+}
+#recordings .play-mini:hover { border-color: var(--accent); background: rgba(76,201,240,.12); }

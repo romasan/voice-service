@@ -11,7 +11,6 @@
   const subtitle = $('subtitle');
   const recBtn = $('rec');
   const recLabel = $('rec-label');
-  const playBtn = $('play');
   const recInfo = $('recinfo');
   const gainInput = $('gain');
   const gainVal = $('gain-val');
@@ -284,7 +283,6 @@
       li.className = 'empty';
       li.textContent = 'пока пусто — нажмите Record';
       listEl.appendChild(li);
-      playBtn.disabled = true;
       return;
     }
     for (const r of state.recordings) {
@@ -307,11 +305,21 @@
         if (state.selected === r.name) state.selected = null;
         refreshRecordings();
       });
+      const mini = document.createElement('button');
+      mini.className = 'play-mini';
+      mini.type = 'button';
+      mini.title = 'прослушать';
+      mini.setAttribute('aria-label', 'прослушать ' + r.name);
+      mini.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        select(r.name);
+        play(r);
+      });
+      li.appendChild(mini);
       li.appendChild(name); li.appendChild(dur); li.appendChild(del);
       li.addEventListener('click', () => { select(r.name); play(r); });
       listEl.appendChild(li);
     }
-    playBtn.disabled = !state.selected;
   }
 
   function select(name) {
@@ -319,7 +327,6 @@
     for (const li of listEl.children) {
       if (li.dataset) li.classList.toggle('sel', li.dataset.name === name);
     }
-    playBtn.disabled = !name;
   }
 
   async function refreshRecordings(preferName) {
@@ -377,7 +384,6 @@
     }
   });
 
-  playBtn.addEventListener('click', () => play());
   player.addEventListener('ended', () => { recInfo.textContent = ''; });
   player.addEventListener('play', () => { recInfo.textContent = '▶ ' + (state.selected || '').replace(/\.wav$/, ''); });
 
