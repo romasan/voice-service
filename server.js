@@ -10,6 +10,25 @@ const fs = require('fs');
 const path = require('path');
 const { spawn, execFile } = require('child_process');
 
+function loadEnvFile() {
+  const file = path.join(__dirname, '.env');
+  let raw = '';
+  try { raw = fs.readFileSync(file, 'utf8'); } catch (e) { return; }
+  for (const line of raw.split('\n')) {
+    const s = line.trim();
+    if (!s || s.startsWith('#')) continue;
+    const i = s.indexOf('=');
+    if (i < 1) continue;
+    const key = s.slice(0, i).trim();
+    let value = s.slice(i + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (!(key in process.env)) process.env[key] = value;
+  }
+}
+loadEnvFile();
+
 const PORT = Number(process.env.PORT || 8092);
 const HOST = process.env.HOST || '0.0.0.0';
 const RATE = Number(process.env.RATE || 16000);
@@ -1260,46 +1279,30 @@ function btState() {
 const https = require('https');
 
 const LLM_BASE = process.env.LLM_BASE_URL || 'https://api.deepseek.com';
+const LLM_URL = new URL(LLM_BASE);
+const LLM_HOST = LLM_URL.hostname;
+const LLM_PORT = LLM_URL.port ? Number(LLM_URL.port) : 443;
+const LLM_PREFIX = LLM_URL.pathname.replace(/\/+$/, '');
 
 const llm = {
-  key: null, keyAt: 0,
   models: null, modelsAt: 0,
   history: [],
   queue: [], speaking: false,
   busy: false, lastError: null,
 };
 
-const READ_KEY_PY = [
-  'import sqlite3, json, os, sys',
-  "p = os.path.expanduser('~/.openclaw/state/openclaw.sqlite')",
-  'try:',
-  "    con = sqlite3.connect('file:%s?mode=ro' % p, uri=True)",
-  "    row = con.execute(\"select value_json from config_machine_state where state_key='authProfiles.store'\").fetchone()",
-  "    d = json.loads(row[0]) if row else {}",
-  "    for pr in d.get('profiles', {}).values():",
-  "        if pr.get('provider') == 'deepseek' and pr.get('key'):",
-  "            print(pr['key']); break",
-  'except Exception as e:',
-  '    pass',
-].join('\n');
-
 function llmKey() {
-  if (process.env.LLM_API_KEY) return process.env.LLM_API_KEY;
-  if (llm.key && Date.now() - llm.keyAt < 600000) return llm.key;
-  try {
-    const out = execFileSync('python3', ['-c', READ_KEY_PY], { timeout: 8000 }).toString().trim();
-    if (out) { llm.key = out; llm.keyAt = Date.now(); return out; }
-  } catch (e) { /* ignore */ }
-  return null;
+  return process.env.LLM_API_KEY || null;
 }
 
 function llmRequest(method, pathName, bodyObj, onResponse, onError) {
   const key = llmKey();
-  if (!key) return onError(new Error('нет API-ключа: задайте LLM_API_KEY или профиль deepseek в OpenClaw'));
+  if (!key) return onError(new Error('нет API-ключа: добавьте LLM_API_KEY в ' + path.join(__dirname, '.env')));
   const payload = bodyObj ? JSON.stringify(bodyObj) : null;
   const req = https.request({
-    host: 'api.deepseek.com',
-    path: pathName,
+    host: LLM_HOST,
+    port: LLM_PORT,
+    path: LLM_PREFIX + pathName,
     method: method,
     timeout: 120000,
     headers: Object.assign(
@@ -1693,6 +1696,8 @@ const server = http.createServer((req, res) => {
           models: models || [],
           error: err ? err.message : null,
           key: !!llmKey(),
+          base: LLM_BASE,
+          keySource: llmKey() ? (process.env.LLM_API_KEY ? '.env / environment' : null) : null,
           config: cfg.llm,
           busy: llm.busy,
           speaking: llm.speaking,
