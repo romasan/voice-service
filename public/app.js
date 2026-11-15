@@ -227,6 +227,39 @@
       }
     });
     es.addEventListener('cmd', () => { loadHistory(); });
+
+    es.addEventListener('llm', (e) => {
+      const d = JSON.parse(e.data);
+      if (d.type === 'start') {
+        llmUi.busy = true;
+        llmUi.answer = '';
+        $('llm-prompt').textContent = 'Вы: ' + (d.prompt || '');
+        llmShowAnswer('');
+        $('llm-status').textContent = 'думаю…';
+      } else if (d.type === 'delta') {
+        llmUi.answer += d.delta || '';
+        $('llm-text').textContent = llmUi.answer;
+      } else if (d.type === 'done') {
+        llmUi.busy = false;
+        if (d.text) llmShowAnswer(d.text);
+        $('llm-status').textContent = 'готово';
+      } else if (d.type === 'speaking') {
+        llmUi.speaking = true;
+        $('llm-status').textContent = 'проговариваю: ' + (d.text || '').slice(0, 60);
+      } else if (d.type === 'error') {
+        llmUi.busy = false;
+        llmUi.error = d.error;
+        $('llm-status').textContent = 'ошибка: ' + d.error;
+      } else if (d.type === 'busy') {
+        $('llm-status').textContent = 'уже отвечаю…';
+      } else if (d.type === 'reset') {
+        llmUi.answer = '';
+        $('llm-text').textContent = 'Ответ появится здесь';
+      } else if (d.type === 'config') {
+        llmApplyConfig(d.config);
+      }
+      llmBadge();
+    });
     es.addEventListener('history', (e) => {
       const d = JSON.parse(e.data);
       if (d.cleared) renderHistory([]); else loadHistory();
@@ -758,6 +791,152 @@
     }
   });
 
+  /* ---------- LLM ---------- */
+  const llmUi = { enabled: false, model: '', busy: false, speaking: false, answer: '', error: null };
+
+  function llmBadge() {
+    const b = $('llm-badge');
+    let cls = 'off';
+    let label = 'выкл';
+    if (llmUi.error) { cls = 'error'; label = 'ошибка'; }
+    else if (!llmUi.enabled) { cls = 'off'; label = 'выкл'; }
+    else if (llmUi.busy) { cls = 'armed'; label = 'думает'; }
+    else if (llmUi.speaking) { cls = 'ready'; label = 'говорит'; }
+    else { cls = 'ready'; label = 'готов'; }
+    b.className = 'badge ' + cls;
+    b.textContent = label;
+    b.title = llmUi.error || '';
+  }
+
+  function llmApplyConfig(cfg) {
+    if (!cfg) return;
+    llmUi.enabled = !!cfg.enabled;
+    llmUi.model = cfg.model || '';
+    $('llm-enabled').checked = !!cfg.enabled;
+    $('llm-thinking').checked = !!cfg.thinking;
+    $('llm-stream').checked = cfg.stream !== false;
+    $('llm-max').value = cfg.maxTokens || 300;
+    $('llm-system').value = cfg.systemPrompt || '';
+    if ($('llm-model').options.length) $('llm-model').value = llmUi.model;
+    llmBadge();
+  }
+
+  async function loadLlm() {
+    try {
+      const r = await fetch('/api/llm/options', { cache: 'no-store' });
+      const d = await r.json();
+      const sel = $('llm-model');
+      sel.innerHTML = '';
+      for (const m of d.models || []) {
+        const o = document.createElement('option');
+        o.value = m.id;
+        o.textContent = m.name && m.name !== m.id ? m.id + ' — ' + m.name : m.id;
+        sel.appendChild(o);
+      }
+      if (!sel.options.length && d.config && d.config.model) {
+        const o = document.createElement('option');
+        o.value = d.config.model;
+        o.textContent = d.config.model;
+        sel.appendChild(o);
+      }
+      llmApplyConfig(d.config);
+      if (d.error) { llmUi.error = d.error; $('llm-note').textContent = d.error; }
+      else if (!d.key) { $('llm-note').textContent = 'нет API-ключа на сервере'; }
+      else { $('llm-note').textContent = d.models.length + ' моделей · ключ найден'; }
+      llmBadge();
+    } catch (e) {
+      $('llm-note').textContent = 'не удалось получить модели: ' + e.message;
+      llmUi.error = e.message;
+      llmBadge();
+    }
+  }
+
+  function llmShowAnswer(text) {
+    llmUi.answer = text || '';
+    $('llm-text').textContent = llmUi.answer || '—';
+  }
+
+  $('llm-enabled').addEventListener('change', () => {
+    llmUi.enabled = $('llm-enabled').checked;
+    llmBadge();
+    saveLlm();
+  });
+
+  async function saveLlm() {
+    const body = {
+      enabled: $('llm-enabled').checked,
+      model: $('llm-model').value,
+      thinking: $('llm-thinking').checked,
+      stream: $('llm-stream').checked,
+      maxTokens: Number($('llm-max').value) || 300,
+      systemPrompt: $('llm-system').value,
+    };
+    try {
+      const r = await fetch('/api/llm/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const d = await r.json();
+      if (d.error) { $('llm-saved').textContent = d.error; return; }
+      llmApplyConfig(d.config);
+      $('llm-saved').textContent = 'сохранено';
+      setTimeout(() => { $('llm-saved').textContent = ''; }, 2500);
+    } catch (e) {
+      $('llm-saved').textContent = 'ошибка: ' + e.message;
+    }
+  }
+
+  $('llm-form').addEventListener('submit', (ev) => { ev.preventDefault(); saveLlm(); });
+
+  $('llm-reset').addEventListener('click', async () => {
+    await fetch('/api/llm/reset', { method: 'POST' }).catch(() => {});
+    llmShowAnswer('');
+    $('llm-prompt').textContent = '—';
+    $('llm-status').textContent = 'контекст сброшен';
+  });
+
+  async function askLlm(text) {
+    if (!text.trim()) return;
+    llmUi.error = null;
+    llmUi.busy = true;
+    $('llm-prompt').textContent = 'Вы: ' + text.trim();
+    llmShowAnswer('');
+    $('llm-status').textContent = 'думаю…';
+    llmBadge();
+    try {
+      const r = await fetch('/api/llm/ask', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: text.trim() }),
+      });
+      const d = await r.json();
+      if (d.error) {
+        llmUi.error = d.error;
+        $('llm-status').textContent = 'ошибка: ' + d.error;
+        return;
+      }
+      llmShowAnswer(d.text);
+      $('llm-status').textContent = 'готово · ' + (d.usage && d.usage.completion_tokens ? d.usage.completion_tokens + ' токенов' : '');
+    } catch (e) {
+      llmUi.error = e.message;
+      $('llm-status').textContent = 'ошибка: ' + e.message;
+    } finally {
+      llmUi.busy = false;
+      llmBadge();
+    }
+  }
+
+  $('llm-ask').addEventListener('click', () => {
+    const t = $('llm-test-text').value;
+    $('llm-test-text').value = '';
+    askLlm(t);
+  });
+
+  $('llm-test-text').addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); $('llm-ask').click(); }
+  });
+
   /* ---------- системный звук ---------- */
   const audioUi = { sinks: [], sources: [], card: null, sinkTimer: null, sourceTimer: null };
 
@@ -1117,6 +1296,7 @@
       await refreshRecordings();
       await loadAsr();
       await loadTts();
+      await loadLlm();
       await loadAudio(pick);
       await loadBt();
       btStartPolling();

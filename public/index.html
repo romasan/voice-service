@@ -141,6 +141,44 @@
     </form>
   </section>
 
+  <section class="sec" id="llm-sec">
+    <h2>LLM <span class="hint">DeepSeek · ответ уходит в озвучку</span></h2>
+    <div class="row">
+      <label class="chk"><input id="llm-enabled" type="checkbox"><span>включить LLM</span></label>
+      <span id="llm-badge" class="badge off">выкл</span>
+      <span id="llm-note" class="muted small"></span>
+    </div>
+
+    <div class="llm-answer" id="llm-answer">
+      <div class="llm-prompt" id="llm-prompt">—</div>
+      <div class="llm-text" id="llm-text">Ответ появится здесь</div>
+    </div>
+
+    <form id="llm-form" class="formgrid">
+      <label class="llm-model-label">Модель
+        <select id="llm-model"></select>
+      </label>
+      <label>max_tokens
+        <input id="llm-max" type="number" min="16" max="8192" step="8" value="300">
+      </label>
+      <label class="chk"><input id="llm-thinking" type="checkbox"><span>thinking</span></label>
+      <label class="chk"><input id="llm-stream" type="checkbox" checked><span>stream</span></label>
+      <button type="submit" class="btn small">Сохранить</button>
+      <button type="button" class="btn small" id="llm-reset">Новый диалог</button>
+      <span id="llm-saved" class="muted small"></span>
+    </form>
+
+    <label class="llm-prompt-label">Системный промпт
+      <textarea id="llm-system" rows="3"></textarea>
+    </label>
+
+    <div class="row llm-test">
+      <input id="llm-test-text" type="text" placeholder="Проверить текстом, без микрофона…">
+      <button type="button" class="btn small" id="llm-ask">Спросить</button>
+      <span id="llm-status" class="muted small"></span>
+    </div>
+  </section>
+
   <section class="sec">
     <h2>Системный звук <span class="hint" id="audio-hint">PulseAudio · node1</span></h2>
     <div class="audio-grid">

@@ -355,6 +355,8 @@ const PYTHON = process.env.PYTHON || (fs.existsSync('/home/r/bin/python3') ? '/h
 const VAD_MODEL = process.env.VAD_MODEL || path.join(os.homedir(), '.local/opt/silero-vad/silero_vad.onnx');
 function vadAvailable() { return fs.existsSync(VAD_MODEL); }
 
+const LLM_DEFAULT_PROMPT = 'Ты голосовой ассистент.\nОтвечай по-русски, кратко и естественно.\nНе используй Markdown.';
+
 function defaultCfg() {
   return {
     asr: { model: '', wakeWord: 'антон', requireWake: true, silenceMs: 1200, vad: true, vadThreshold: 0.5 },
@@ -363,6 +365,14 @@ function defaultCfg() {
       espeak: { voice: 'ru', speed: 150, pitch: 50, amplitude: 100 },
       rhvoice: { voice: 'aleksandr', rate: 100, pitch: 100, volume: 100 },
       piper: { voice: '', lengthScale: 1, noiseScale: 0.667, sentenceSilence: 0.2 },
+    },
+    llm: {
+      enabled: false,
+      model: 'deepseek-flash',
+      thinking: false,
+      stream: true,
+      maxTokens: 300,
+      systemPrompt: LLM_DEFAULT_PROMPT,
     },
   };
 }
@@ -400,7 +410,7 @@ function loadCfg() {
   const base = defaultCfg();
   let c;
   try { c = JSON.parse(fs.readFileSync(CFG_PATH, 'utf8')); } catch (e) { return base; }
-  const out = { asr: Object.assign(base.asr, c.asr || {}), tts: base.tts };
+  const out = { asr: Object.assign(base.asr, c.asr || {}), tts: base.tts, llm: Object.assign(base.llm, c.llm || {}) };
   const tts = c.tts || {};
   if (tts.engine) out.tts.engine = tts.engine;
   if (tts.espeak) Object.assign(out.tts.espeak, tts.espeak);
@@ -652,6 +662,7 @@ function pushCommand(text, viaWake) {
   const item = addHistory(text, { viaWake: !!viaWake, source: 'vosk' });
   broadcast('cmd', { item });
   broadcast('asr', Object.assign({ type: 'idle' }, asrState()));
+  if (cfg.llm.enabled) respondWithLlm(text);
 }
 
 function handleUtterance(rawText) {
@@ -1245,6 +1256,241 @@ function btState() {
   return { controller: controller, devices: devices, sinks: Object.values(sinks) };
 }
 
+/* ---------- LLM (DeepSeek, OpenAI-compatible) ---------- */
+const https = require('https');
+
+const LLM_BASE = process.env.LLM_BASE_URL || 'https://api.deepseek.com';
+
+const llm = {
+  key: null, keyAt: 0,
+  models: null, modelsAt: 0,
+  history: [],
+  queue: [], speaking: false,
+  busy: false, lastError: null,
+};
+
+const READ_KEY_PY = [
+  'import sqlite3, json, os, sys',
+  "p = os.path.expanduser('~/.openclaw/state/openclaw.sqlite')",
+  'try:',
+  "    con = sqlite3.connect('file:%s?mode=ro' % p, uri=True)",
+  "    row = con.execute(\"select value_json from config_machine_state where state_key='authProfiles.store'\").fetchone()",
+  "    d = json.loads(row[0]) if row else {}",
+  "    for pr in d.get('profiles', {}).values():",
+  "        if pr.get('provider') == 'deepseek' and pr.get('key'):",
+  "            print(pr['key']); break",
+  'except Exception as e:',
+  '    pass',
+].join('\n');
+
+function llmKey() {
+  if (process.env.LLM_API_KEY) return process.env.LLM_API_KEY;
+  if (llm.key && Date.now() - llm.keyAt < 600000) return llm.key;
+  try {
+    const out = execFileSync('python3', ['-c', READ_KEY_PY], { timeout: 8000 }).toString().trim();
+    if (out) { llm.key = out; llm.keyAt = Date.now(); return out; }
+  } catch (e) { /* ignore */ }
+  return null;
+}
+
+function llmRequest(method, pathName, bodyObj, onResponse, onError) {
+  const key = llmKey();
+  if (!key) return onError(new Error('нет API-ключа: задайте LLM_API_KEY или профиль deepseek в OpenClaw'));
+  const payload = bodyObj ? JSON.stringify(bodyObj) : null;
+  const req = https.request({
+    host: 'api.deepseek.com',
+    path: pathName,
+    method: method,
+    timeout: 120000,
+    headers: Object.assign(
+      { Authorization: 'Bearer ' + key },
+      payload ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {}
+    ),
+  }, (res) => {
+    if (res.statusCode !== 200) {
+      let errBody = '';
+      res.on('data', (d) => { errBody += d.toString(); });
+      res.on('end', () => {
+        let msg = errBody;
+        try { const j = JSON.parse(errBody); msg = (j.error && (j.error.message || j.error.type)) || errBody; } catch (e) { /* ignore */ }
+        onError(new Error('HTTP ' + res.statusCode + ': ' + String(msg).slice(0, 300)));
+      });
+      return;
+    }
+    onResponse(res);
+  });
+  req.on('timeout', () => { req.destroy(new Error('таймаут запроса к LLM')); });
+  req.on('error', onError);
+  if (payload) req.write(payload);
+  req.end();
+}
+
+function llmModels(cb) {
+  if (llm.models && Date.now() - llm.modelsAt < 600000) return cb(null, llm.models);
+  llmRequest('GET', '/models', null, (res) => {
+    let raw = '';
+    res.on('data', (d) => { raw += d.toString(); });
+    res.on('end', () => {
+      try {
+        const d = JSON.parse(raw);
+        const list = (d.data || []).map((m) => ({
+          id: m.id,
+          name: m.name || m.id,
+          effort: m.effort || null,
+          contextWindow: m.context_window || null,
+        }));
+        llm.models = list;
+        llm.modelsAt = Date.now();
+        cb(null, list);
+      } catch (e) { cb(e); }
+    });
+  }, (err) => cb(err));
+}
+
+/* ---------- озвучка ответа ---------- */
+function currentTtsOpts() {
+  const engine = cfg.tts.engine === 'rhvoice' ? 'rhvoice' : cfg.tts.engine === 'piper' ? 'piper' : 'espeak';
+  const built = buildTtsOptions({ engine: engine });
+  return built.error ? null : built.opts;
+}
+
+function enqueueSpeech(text) {
+  const t = String(text || '').trim();
+  if (!t) return;
+  llm.queue.push(t);
+  pumpSpeech();
+}
+
+function pumpSpeech() {
+  if (llm.speaking || !llm.queue.length) return;
+  const text = llm.queue.shift();
+  const opts = currentTtsOpts();
+  if (!opts) { broadcast('llm', { type: 'tts-error', error: 'TTS не настроен' }); pumpSpeech(); return; }
+  llm.speaking = true;
+  synthesize(text, opts, (err, info) => {
+    llm.speaking = false;
+    if (err) broadcast('llm', { type: 'tts-error', error: err.message });
+    else broadcast('llm', { type: 'speaking', text: text, url: info.url, duration: info.duration });
+    pumpSpeech();
+  });
+}
+
+function takeSentences(state) {
+  const parts = [];
+  const re = /[^.!?…\n]+[.!?…]+(\s|$)|\n+/g;
+  let idx = 0;
+  let m;
+  while ((m = re.exec(state.buf)) !== null) {
+    const chunk = m[0].trim();
+    idx = re.lastIndex;
+    if (chunk.length >= 2) parts.push(chunk);
+  }
+  state.buf = state.buf.slice(idx);
+  return parts;
+}
+
+/* ---------- чат ---------- */
+function llmChat(userText, cb) {
+  const body = {
+    model: cfg.llm.model,
+    messages: [{ role: 'system', content: cfg.llm.systemPrompt || LLM_DEFAULT_PROMPT }]
+      .concat(llm.history)
+      .concat([{ role: 'user', content: userText }]),
+    max_tokens: clamp(cfg.llm.maxTokens, 16, 8192),
+    stream: !!cfg.llm.stream,
+    thinking: { type: cfg.llm.thinking ? 'enabled' : 'disabled' },
+  };
+
+  if (!body.stream) {
+    llmRequest('POST', '/chat/completions', body, (res) => {
+      let raw = '';
+      res.on('data', (d) => { raw += d.toString(); });
+      res.on('end', () => {
+        try {
+          const d = JSON.parse(raw);
+          const msg = d.choices && d.choices[0] && d.choices[0].message;
+          const text = ((msg && msg.content) || '').trim();
+          const reasoning = (msg && msg.reasoning_content) || '';
+          remember(userText, text);
+          if (text) enqueueSpeech(text);
+          cb(null, { text: text, reasoning: reasoning, usage: d.usage || null, finish: d.choices && d.choices[0] && d.choices[0].finish_reason });
+        } catch (e) { cb(e); }
+      });
+    }, (err) => cb(err));
+    return;
+  }
+
+  const state = { buf: '' };
+  let full = '';
+  let reasoning = '';
+  let finish = null;
+  let usage = null;
+
+  llmRequest('POST', '/chat/completions', body, (res) => {
+    res.setEncoding('utf8');
+    let rest = '';
+    res.on('data', (chunk) => {
+      rest += chunk;
+      let nl;
+      while ((nl = rest.indexOf('\n')) >= 0) {
+        const line = rest.slice(0, nl).trim();
+        rest = rest.slice(nl + 1);
+        if (!line || line.indexOf('data:') !== 0) continue;
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]') continue;
+        let ev;
+        try { ev = JSON.parse(payload); } catch (e) { continue; }
+        const choice = ev.choices && ev.choices[0];
+        if (!choice) continue;
+        if (choice.finish_reason) finish = choice.finish_reason;
+        if (ev.usage) usage = ev.usage;
+        const delta = choice.delta || {};
+        if (delta.reasoning_content) {
+          reasoning += delta.reasoning_content;
+          broadcast('llm', { type: 'reasoning', delta: delta.reasoning_content });
+        }
+        if (delta.content) {
+          full += delta.content;
+          state.buf += delta.content;
+          broadcast('llm', { type: 'delta', delta: delta.content });
+          for (const s of takeSentences(state)) enqueueSpeech(s);
+        }
+      }
+    });
+    res.on('end', () => {
+      const tail = state.buf.trim();
+      if (tail) enqueueSpeech(tail);
+      state.buf = '';
+      const text = full.trim();
+      remember(userText, text);
+      cb(null, { text: text, reasoning: reasoning, usage: usage, finish: finish });
+    });
+    res.on('error', (e) => cb(e));
+  }, (err) => cb(err));
+}
+
+function remember(userText, answer) {
+  llm.history.push({ role: 'user', content: userText });
+  llm.history.push({ role: 'assistant', content: answer });
+  if (llm.history.length > 8) llm.history = llm.history.slice(-8);
+}
+
+function respondWithLlm(text) {
+  if (llm.busy) { broadcast('llm', { type: 'busy', text: text }); return; }
+  llm.busy = true;
+  llm.lastError = null;
+  broadcast('llm', { type: 'start', prompt: text });
+  llmChat(text, (err, result) => {
+    llm.busy = false;
+    if (err) {
+      llm.lastError = err.message;
+      broadcast('llm', { type: 'error', error: err.message });
+      return;
+    }
+    broadcast('llm', { type: 'done', text: result.text, finish: result.finish, usage: result.usage });
+  });
+}
+
 /* ---------- HTTP ---------- */
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://' + (req.headers.host || 'localhost'));
@@ -1440,6 +1686,63 @@ const server = http.createServer((req, res) => {
           try { sendJson(res, Object.assign({ ok: true }, btState())); } catch (e) { sendJson(res, { error: e.message }, 500); }
         });
       });
+    }
+    if (p === '/api/llm/options') {
+      return llmModels((err, models) => {
+        sendJson(res, {
+          models: models || [],
+          error: err ? err.message : null,
+          key: !!llmKey(),
+          config: cfg.llm,
+          busy: llm.busy,
+          speaking: llm.speaking,
+          history: llm.history.length,
+        });
+      });
+    }
+    if (p === '/api/llm/config') {
+      if (method !== 'POST') return sendJson(res, { error: 'POST required' }, 405);
+      return readBody(req, (err, body) => {
+        if (err) return sendJson(res, { error: 'bad json' }, 400);
+        const l = cfg.llm;
+        if (body.enabled !== undefined) l.enabled = !!body.enabled;
+        if (body.model !== undefined) l.model = String(body.model).slice(0, 80);
+        if (body.thinking !== undefined) l.thinking = !!body.thinking;
+        if (body.stream !== undefined) l.stream = !!body.stream;
+        if (body.maxTokens !== undefined) l.maxTokens = clamp(body.maxTokens, 16, 8192);
+        if (body.systemPrompt !== undefined) l.systemPrompt = String(body.systemPrompt).slice(0, 8000);
+        saveCfg();
+        broadcast('llm', { type: 'config', config: cfg.llm });
+        sendJson(res, { ok: true, config: cfg.llm });
+      });
+    }
+    if (p === '/api/llm/ask') {
+      if (method !== 'POST') return sendJson(res, { error: 'POST required' }, 405);
+      return readBody(req, (err, body) => {
+        if (err) return sendJson(res, { error: 'bad json' }, 400);
+        const text = String((body && body.text) || '').trim().slice(0, 4000);
+        if (!text) return sendJson(res, { error: 'пустой текст' }, 400);
+        if (llm.busy) return sendJson(res, { error: 'уже отвечаю на предыдущий запрос' }, 409);
+        llm.busy = true;
+        llm.lastError = null;
+        broadcast('llm', { type: 'start', prompt: text });
+        llmChat(text, (err2, result) => {
+          llm.busy = false;
+          if (err2) {
+            llm.lastError = err2.message;
+            broadcast('llm', { type: 'error', error: err2.message });
+            return sendJson(res, { error: err2.message }, 500);
+          }
+          broadcast('llm', { type: 'done', text: result.text, finish: result.finish, usage: result.usage });
+          sendJson(res, { ok: true, text: result.text, reasoning: result.reasoning, finish: result.finish, usage: result.usage });
+        });
+      });
+    }
+    if (p === '/api/llm/reset') {
+      llm.history = [];
+      llm.queue = [];
+      broadcast('llm', { type: 'reset' });
+      return sendJson(res, { ok: true });
     }
     if (p === '/api/audio') {
       try {
