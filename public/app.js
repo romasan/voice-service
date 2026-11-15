@@ -289,6 +289,9 @@
       const li = document.createElement('li');
       li.dataset.name = r.name;
       if (state.selected === r.name) li.classList.add('sel');
+      const prog = document.createElement('div');
+      prog.className = 'prog';
+      li.appendChild(prog);
       const name = document.createElement('span');
       name.className = 'name';
       name.textContent = r.name.replace(/\.wav$/, '').replace('rec-', '');
@@ -341,10 +344,21 @@
   }
 
   /* ---------- воспроизведение ---------- */
+  function rowProgress(name, pct) {
+    for (const li of listEl.children) {
+      if (!li.dataset || li.dataset.name !== name) continue;
+      const bar = li.querySelector('.prog');
+      if (bar) bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+    }
+  }
+
   function play(rec) {
     const item = rec || state.recordings.find((x) => x.name === state.selected) || state.recordings[0];
     if (!item) return;
     state.selected = item.name;
+    if (state.playingName && state.playingName !== item.name) rowProgress(state.playingName, 0);
+    state.playingName = item.name;
+    rowProgress(item.name, 0);
     player.src = item.url + '?t=' + Date.now();
     player.play().catch((e) => { recInfo.textContent = 'не удалось воспроизвести: ' + e.message; });
   }
@@ -384,7 +398,18 @@
     }
   });
 
-  player.addEventListener('ended', () => { recInfo.textContent = ''; });
+  player.addEventListener('timeupdate', () => {
+    if (!state.playingName) return;
+    const dur = player.duration;
+    if (!isFinite(dur) || !dur) return;
+    rowProgress(state.playingName, (player.currentTime / dur) * 100);
+  });
+
+  player.addEventListener('ended', () => {
+    if (state.playingName) rowProgress(state.playingName, 0);
+    state.playingName = null;
+    recInfo.textContent = '';
+  });
   player.addEventListener('play', () => { recInfo.textContent = '▶ ' + (state.selected || '').replace(/\.wav$/, ''); });
 
   gainInput.addEventListener('input', () => {

@@ -207,3 +207,12 @@ textarea { resize: vertical; min-height: 52px; }
   border-top: 6px solid transparent; border-bottom: 6px solid transparent;
 }
 #recordings .play-mini:hover { border-color: var(--accent); background: rgba(76,201,240,.12); }
+
+#recordings li { position: relative; overflow: hidden; }
+#recordings li .prog {
+  position: absolute; left: 0; top: 0; bottom: 0; width: 0;
+  background: rgba(76, 201, 240, 0.16);
+  border-right: 1px solid rgba(76, 201, 240, 0.35);
+  pointer-events: none; transition: width 0.1s linear;
+}
+#recordings li > *:not(.prog) { position: relative; z-index: 1; }
