@@ -124,6 +124,20 @@ pm2: `pm2 start server.js --name voice-service`, автозапуск — чер
 SSE дополнительно отдаёт события `asr` (partial/final/wake/ignored/idle/error), `cmd` (распознанная
 команда), `history`, `tts`. В `hello` теперь приходят состояние ASR и последние фразы.
 
+### Третий движок вывода: Piper
+
+- Бинарь: `piper-tts 1.8.0` из PyPI (ставится в venv `/home/r`, скрипт `~/bin/piper`);
+  резервный вариант — официальный `piper_linux_x86_64.tar.gz` распакован в `~/.local/opt/piper/piper`.
+  Сервис сам выбирает современный бинарь (по наличию флага `--data-dir` в `--help`) и подставляет нужные флаги.
+- Голоса — с HuggingFace `rhasspy/piper-voices`, все четыре русских medium: denis, dmitri, irina, ruslan
+  (по 63 МБ, лежат в `~/.local/opt/piper/voices`, всего ~250 МБ). Новый голос = положить `*.onnx` и `*.onnx.json` в эту папку,
+  сервис подхватит при следующем запросе. Голоса без `.onnx.json` пропускаются — Piper без конфига не стартует.
+- Параметры: `--length_scale` (темп: меньше — быстрее, 0.5–2.0), `--noise_scale` (вариативность, 0–1.2),
+  `--sentence_silence` (пауза между фразами, 0–1 с). Выход WAV 22.05 кГц моно, RTF ~0.3 (быстрее реального времени).
+- В конфиге: `tts.piper = {voice, lengthScale, noiseScale, sentenceSilence}`; движок запоминается вместе с остальными.
+- Известная особенность: старый бинарь 2023.11 падает на голосе denis (`"aɪ" is not a single codepoint`),
+  поэтому по умолчанию используется piper 1.8 из pip.
+
 ### Системный звук
 
 Секция «Системный звук» управляет тем же PulseAudio/ALSA, что использует сервис, — без ssh.

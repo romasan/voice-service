@@ -525,7 +525,8 @@
   function bindRange(id) {
     const el = $(id);
     const out = $(id + '-v');
-    const sync = () => { if (out) out.textContent = el.value; };
+    const fmt = (v) => (id.indexOf('pip-') === 0 ? Number(v).toFixed(2) : v);
+    const sync = () => { if (out) out.textContent = fmt(el.value); };
     el.addEventListener('input', sync);
     sync();
   }
@@ -556,6 +557,11 @@
     for (const v of voices) {
       const o = document.createElement('option');
       o.value = v.id;
+      if (engine.id === 'piper') {
+        o.textContent = v.name + (v.quality ? ' · ' + v.quality : '') + (v.language ? ' · ' + v.language : '');
+        ttsVoice.appendChild(o);
+        continue;
+      }
       let label = v.id;
       if (v.name && v.name !== v.id) label += ' — ' + v.name;
       if (v.language) label += ' · ' + v.language;
@@ -573,6 +579,7 @@
     if (radio && !radio.disabled) radio.checked = true;
     $('params-espeak').hidden = engine.id !== 'espeak';
     $('params-rhvoice').hidden = engine.id !== 'rhvoice';
+    $('params-piper').hidden = engine.id !== 'piper';
     fillVoices(engine);
     const cfg = (ttsUi.config && ttsUi.config[engine.id]) || engine.defaults || {};
     if (engine.id === 'espeak') {
@@ -585,6 +592,17 @@
       $('tts-pitch-v').textContent = $('tts-pitch').value;
       $('tts-amp-v').textContent = $('tts-amp').value;
       $('engine-note').textContent = (engine.voices.length + ESPEAK_VARIANTS.length) + ' вариантов';
+    } else if (engine.id === 'piper') {
+      ttsVoice.value = cfg.voice || (engine.voices[0] && engine.voices[0].id) || '';
+      if (ttsVoice.selectedIndex < 0) ttsVoice.selectedIndex = 0;
+      $('pip-length').value = cfg.lengthScale != null ? cfg.lengthScale : 1;
+      $('pip-noise').value = cfg.noiseScale != null ? cfg.noiseScale : 0.667;
+      $('pip-silence').value = cfg.sentenceSilence != null ? cfg.sentenceSilence : 0.2;
+      ['pip-length', 'pip-noise', 'pip-silence'].forEach((id) => { $(id + '-v').textContent = Number($(id).value).toFixed(2); });
+      const langs = [...new Set(engine.voices.map((v) => v.language).filter(Boolean))].join(', ');
+      $('engine-note').textContent = !engine.available
+        ? 'движок не установлен'
+        : 'голосов: ' + engine.voices.length + (langs ? ' · ' + langs : '');
     } else {
       ttsVoice.value = cfg.voice || (engine.voices[0] && engine.voices[0].id) || '';
       if (ttsVoice.selectedIndex < 0) ttsVoice.selectedIndex = 0;
@@ -602,7 +620,7 @@
   }
 
   async function loadTts() {
-    ['tts-speed', 'tts-pitch', 'tts-amp', 'rhv-rate', 'rhv-pitch', 'rhv-vol'].forEach(bindRange);
+    ['tts-speed', 'tts-pitch', 'tts-amp', 'rhv-rate', 'rhv-pitch', 'rhv-vol', 'pip-length', 'pip-noise', 'pip-silence'].forEach(bindRange);
     document.querySelectorAll('input[name="tts-engine"]').forEach((r) => {
       r.addEventListener('change', () => { if (r.checked) applyEngine(r.value); });
     });
@@ -618,7 +636,17 @@
         rhRadio.parentElement.classList.add('disabled');
         rhRadio.parentElement.title = 'RHVoice не установлен на сервере';
       }
-      const want = ttsUi.config.engine === 'rhvoice' && rh && rh.available ? 'rhvoice' : 'espeak';
+      const pi = ttsUi.engines.find((e) => e.id === 'piper');
+      const piRadio = document.querySelector('input[name="tts-engine"][value="piper"]');
+      if (pi && !pi.available) {
+        piRadio.disabled = true;
+        piRadio.parentElement.classList.add('disabled');
+        piRadio.parentElement.title = 'Piper не установлен на сервере';
+      }
+      const cfgEngine = ttsUi.config.engine;
+      const want = cfgEngine === 'rhvoice' && rh && rh.available ? 'rhvoice'
+        : cfgEngine === 'piper' && pi && pi.available ? 'piper'
+        : 'espeak';
       applyEngine(want);
     } catch (e) {
       $('tts-info').textContent = 'не удалось получить настройки синтеза: ' + e.message;
@@ -632,6 +660,10 @@
       body.rate = Number($('rhv-rate').value);
       body.pitch = Number($('rhv-pitch').value);
       body.volume = Number($('rhv-vol').value);
+    } else if (engine === 'piper') {
+      body.lengthScale = Number($('pip-length').value);
+      body.noiseScale = Number($('pip-noise').value);
+      body.sentenceSilence = Number($('pip-silence').value);
     } else {
       body.speed = Number($('tts-speed').value);
       body.pitch = Number($('tts-pitch').value);
@@ -653,7 +685,7 @@
       const d = await r.json();
       if (d.error) { $('tts-info').textContent = d.error; return; }
       ttsUi.config = d.config || ttsUi.config;
-      const label = d.engine === 'rhvoice' ? 'RHVoice' : 'eSpeak NG';
+      const label = d.engine === 'rhvoice' ? 'RHVoice' : d.engine === 'piper' ? 'Piper' : 'eSpeak NG';
       $('tts-info').textContent = 'сохранено: ' + label + (d.voice ? ' · ' + d.voice : '');
     } catch (e) {
       $('tts-info').textContent = 'ошибка: ' + e.message;
@@ -683,7 +715,7 @@
       });
       const d = await r.json();
       if (d.error) { $('tts-info').textContent = d.error; return; }
-      const label = engine === 'rhvoice' ? 'RHVoice' : 'eSpeak NG';
+      const label = engine === 'rhvoice' ? 'RHVoice' : engine === 'piper' ? 'Piper' : 'eSpeak NG';
       $('tts-info').textContent = 'готово: ' + d.duration.toFixed(1) + ' с · ' + label + ' · ' +
         (d.played ? 'проговорено на сервере' : 'не воспроизведено' + (d.playError ? ' (' + d.playError + ')' : ''));
       const a = $('tts-player');

@@ -360,6 +360,7 @@ function defaultCfg() {
       engine: 'espeak',
       espeak: { voice: 'ru', speed: 150, pitch: 50, amplitude: 100 },
       rhvoice: { voice: 'aleksandr', rate: 100, pitch: 100, volume: 100 },
+      piper: { voice: '', lengthScale: 1, noiseScale: 0.667, sentenceSilence: 0.2 },
     },
   };
 }
@@ -402,6 +403,7 @@ function loadCfg() {
   if (tts.engine) out.tts.engine = tts.engine;
   if (tts.espeak) Object.assign(out.tts.espeak, tts.espeak);
   if (tts.rhvoice) Object.assign(out.tts.rhvoice, tts.rhvoice);
+  if (tts.piper) Object.assign(out.tts.piper, tts.piper);
   // миграция старого плоского формата {voice,speed,pitch,amplitude}
   if (tts.voice && !tts.espeak) {
     out.tts.engine = 'espeak';
@@ -788,7 +790,98 @@ function ttsEngines() {
       params: { rate: [50, 200], pitch: [50, 200], volume: [0, 100] },
       defaults: { voice: '', rate: 100, pitch: 100, volume: 100 },
     },
+    {
+      id: 'piper',
+      name: 'Piper',
+      available: piperBin().available,
+      voices: piperBin().available ? piperVoices() : [],
+      params: { lengthScale: [0.5, 2], noiseScale: [0, 1.2], sentenceSilence: [0, 1] },
+      defaults: { voice: '', lengthScale: 1, noiseScale: 0.667, sentenceSilence: 0.2 },
+    },
   ];
+}
+
+let piperHelpCache = null;
+
+function piperBin() {
+  const prefix = process.env.PIPER_PREFIX || path.join(os.homedir(), '.local/opt/piper');
+  const bundled = path.join(prefix, 'piper/piper');
+  const candidates = [
+    process.env.PIPER_BIN,
+    path.join(os.homedir(), 'bin/piper'), // piper-tts из pip (1.8+, умеет многокодовые фонемы)
+    bundled,
+  ].filter(Boolean);
+  const bin = candidates.find((p) => fs.existsSync(p)) || bundled;
+  if (piperHelpCache === null || piperHelpCache.bin !== bin) {
+    let help = '';
+    try { help = execFileSync(bin, ['--help'], { timeout: 8000 }).toString(); } catch (e) { help = ''; }
+    piperHelpCache = { bin: bin, text: help, modern: help.indexOf('--data-dir') >= 0 };
+  }
+  return {
+    prefix: prefix,
+    bin: bin,
+    dir: path.dirname(bin),
+    voicesDir: process.env.PIPER_VOICES || path.join(prefix, 'voices'),
+    dataDir: path.join(prefix, 'piper/espeak-ng-data'),
+    modern: piperHelpCache.modern,
+    available: fs.existsSync(bin),
+  };
+}
+
+function piperVoices() {
+  const p = piperBin();
+  const out = [];
+  let files = [];
+  try { files = fs.readdirSync(p.voicesDir); } catch (e) { return out; }
+  for (const f of files) {
+    if (!f.endsWith('.onnx')) continue;
+    let meta = {};
+    try {
+      meta = JSON.parse(fs.readFileSync(path.join(p.voicesDir, f + '.json'), 'utf8'));
+    } catch (e) {
+      continue; // без .onnx.json Piper не запустится — такой голос не показываем
+    }
+    const lang = (meta.language && (meta.language.name_native || meta.language.code)) || '';
+    const quality = (meta.audio && meta.audio.quality) || '';
+    const dataset = meta.dataset || f.replace(/^ru_RU-|\.onnx$/g, '');
+    out.push({
+      id: f.replace(/\.onnx$/, ''),
+      name: dataset,
+      language: lang,
+      quality: quality,
+      sampleRate: (meta.audio && meta.audio.sample_rate) || 22050,
+      file: path.join(p.voicesDir, f),
+    });
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function runPiper(text, opts, file, cb) {
+  const p = piperBin();
+  if (!p.available) return cb(new Error('Piper не установлен (' + p.bin + ')'));
+  const voice = piperVoices().find((v) => v.id === opts.voice);
+  if (!voice) return cb(new Error('голос Piper не найден: ' + opts.voice));
+  const args = [
+    '-m', voice.file,
+    '-f', file,
+    '--length_scale', String(opts.lengthScale),
+    '--noise_scale', String(opts.noiseScale),
+    '--sentence_silence', String(opts.sentenceSilence),
+  ];
+  if (!p.modern) args.push('--espeak_data', p.dataDir);
+  const env = Object.assign({}, process.env, {
+    LD_LIBRARY_PATH: p.dir + (process.env.LD_LIBRARY_PATH ? ':' + process.env.LD_LIBRARY_PATH : ''),
+  });
+  const proc = spawn(p.bin, args, { env: env, cwd: p.dir, stdio: ['pipe', 'ignore', 'pipe'] });
+  let errBuf = '';
+  proc.stderr.on('data', (d) => { errBuf = (errBuf + d.toString()).slice(-3000); });
+  proc.on('error', (e) => cb(e));
+  proc.on('exit', (code) => {
+    if (code !== 0) return cb(new Error(errBuf.trim().split('\n').slice(-3).join(' ') || ('piper exit ' + code)));
+    if (!fs.existsSync(file) || fs.statSync(file).size <= 44) return cb(new Error('Piper не создал звук'));
+    cb(null);
+  });
+  proc.stdin.end(text);
 }
 
 function runEspeak(text, opts, file, cb) {
@@ -836,7 +929,7 @@ function runRhvoice(text, opts, file, cb) {
 }
 
 function synthesize(text, opts, cb) {
-  const engine = opts.engine === 'rhvoice' ? 'rhvoice' : 'espeak';
+  const engine = opts.engine === 'rhvoice' ? 'rhvoice' : opts.engine === 'piper' ? 'piper' : 'espeak';
   const name = 'tts-' + timestampName() + '.wav';
   const file = path.join(TTS_DIR, name);
   const finish = (err) => {
@@ -859,13 +952,15 @@ function synthesize(text, opts, cb) {
     });
   };
   if (engine === 'rhvoice') runRhvoice(text, opts, file, finish);
+  else if (engine === 'piper') runPiper(text, opts, file, finish);
   else runEspeak(text, opts, file, finish);
 }
 
 function buildTtsOptions(body) {
   const engine = body.engine === 'rhvoice' ? 'rhvoice'
     : body.engine === 'espeak' ? 'espeak'
-    : (cfg.tts.engine === 'rhvoice' ? 'rhvoice' : 'espeak');
+    : body.engine === 'piper' ? 'piper'
+    : (cfg.tts.engine === 'rhvoice' || cfg.tts.engine === 'piper' ? cfg.tts.engine : 'espeak');
   if (engine === 'rhvoice') {
     if (!rhvoiceBin().available) return { error: 'RHVoice не установлен на сервере', status: 503 };
     const d = cfg.tts.rhvoice || {};
@@ -885,6 +980,26 @@ function buildTtsOptions(body) {
     cfg.tts.engine = engine;
     saveCfg();
     return { engine: engine, opts: opts };
+  }
+  if (engine === 'piper') {
+    if (!piperBin().available) return { error: 'Piper не установлен на сервере', status: 503 };
+    const d = cfg.tts.piper || {};
+    const voices = piperVoices();
+    const voice = String(body.voice || d.voice || (voices[0] && voices[0].id) || '');
+    if (!voice || !voices.some((v) => v.id === voice)) return { error: 'нет установленных голосов Piper', status: 503 };
+    const opts = {
+      engine: 'piper',
+      voice: voice,
+      lengthScale: clamp(body.lengthScale != null ? body.lengthScale : d.lengthScale, 0.5, 2),
+      noiseScale: clamp(body.noiseScale != null ? body.noiseScale : d.noiseScale, 0, 1.2),
+      sentenceSilence: clamp(body.sentenceSilence != null ? body.sentenceSilence : d.sentenceSilence, 0, 1),
+      play: body.play !== false,
+    };
+    cfg.tts.piper = { voice: opts.voice, lengthScale: opts.lengthScale, noiseScale: opts.noiseScale, sentenceSilence: opts.sentenceSilence };
+    opts.params = { lengthScale: opts.lengthScale, noiseScale: opts.noiseScale, sentenceSilence: opts.sentenceSilence };
+    cfg.tts.engine = 'piper';
+    saveCfg();
+    return { engine: 'piper', opts: opts };
   }
   const d = cfg.tts.espeak || {};
   const opts = {
@@ -1359,6 +1474,11 @@ const server = http.createServer((req, res) => {
           const known = rv.voices.some((v) => v.id === cfg.tts.rhvoice.voice);
           if (!known && rv.voices.length) cfg.tts.rhvoice.voice = rv.voices[0].id;
         }
+        const pv = engines.find((e) => e.id === 'piper');
+        if (pv && cfg.tts.piper) {
+          const knownP = pv.voices.some((v) => v.id === cfg.tts.piper.voice);
+          if (!knownP && pv.voices.length) cfg.tts.piper.voice = pv.voices[0].id;
+        }
         sendJson(res, {
           engines: engines,
           config: cfg.tts,
@@ -1386,7 +1506,7 @@ const server = http.createServer((req, res) => {
         const built = buildTtsOptions(body);
         if (built.error) return sendJson(res, { error: built.error }, built.status || 400);
         synthesize(text, built.opts, (serr, info) => {
-          if (serr) return sendJson(res, { error: (built.engine === 'rhvoice' ? 'RHVoice: ' : 'espeak: ') + serr.message }, 500);
+          if (serr) return sendJson(res, { error: (built.engine === 'rhvoice' ? 'RHVoice: ' : built.engine === 'piper' ? 'Piper: ' : 'espeak: ') + serr.message }, 500);
           broadcast('tts', { spoken: info });
           sendJson(res, { ok: true, ...info });
         });
