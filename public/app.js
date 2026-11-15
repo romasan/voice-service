@@ -359,6 +359,7 @@
     if (state.playingName && state.playingName !== item.name) rowProgress(state.playingName, 0);
     state.playingName = item.name;
     rowProgress(item.name, 0);
+    stopProgressLoop();
     player.src = item.url + '?t=' + Date.now();
     player.play().catch((e) => { recInfo.textContent = 'не удалось воспроизвести: ' + e.message; });
   }
@@ -398,14 +399,31 @@
     }
   });
 
-  player.addEventListener('timeupdate', () => {
-    if (!state.playingName) return;
-    const dur = player.duration;
-    if (!isFinite(dur) || !dur) return;
-    rowProgress(state.playingName, (player.currentTime / dur) * 100);
-  });
+  let progRaf = null;
+
+  function stopProgressLoop() {
+    if (progRaf) cancelAnimationFrame(progRaf);
+    progRaf = null;
+  }
+
+  function startProgressLoop() {
+    stopProgressLoop();
+    const tick = () => {
+      const dur = player.duration;
+      if (state.playingName && isFinite(dur) && dur > 0) {
+        rowProgress(state.playingName, (player.currentTime / dur) * 100);
+      }
+      progRaf = requestAnimationFrame(tick);
+    };
+    progRaf = requestAnimationFrame(tick);
+  }
+
+  player.addEventListener('play', startProgressLoop);
+  player.addEventListener('playing', startProgressLoop);
+  player.addEventListener('pause', stopProgressLoop);
 
   player.addEventListener('ended', () => {
+    stopProgressLoop();
     if (state.playingName) rowProgress(state.playingName, 0);
     state.playingName = null;
     recInfo.textContent = '';

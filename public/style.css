@@ -213,6 +213,6 @@ textarea { resize: vertical; min-height: 52px; }
   position: absolute; left: 0; top: 0; bottom: 0; width: 0;
   background: rgba(76, 201, 240, 0.16);
   border-right: 1px solid rgba(76, 201, 240, 0.35);
-  pointer-events: none; transition: width 0.1s linear;
+  pointer-events: none; transition: none; will-change: width;
 }
 #recordings li > *:not(.prog) { position: relative; z-index: 1; }
