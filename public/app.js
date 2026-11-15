@@ -870,6 +870,173 @@
     await postAudio('/api/audio/test', { sink: $('sink-select').value }, hint);
   });
 
+  /* ---------- Bluetooth ---------- */
+  const btUi = { controller: null, devices: [], busy: false, timer: null };
+
+  function btChip(text, cls) {
+    const s = document.createElement('span');
+    s.className = 'bt-chip' + (cls ? ' ' + cls : '');
+    s.textContent = text;
+    return s;
+  }
+
+  function btRenderDevice(d) {
+    const li = document.createElement('li');
+    const main = document.createElement('div');
+    main.className = 'bt-main';
+    const isMacName = /^([0-9A-F]{2}-){5}[0-9A-F]{2}$/i.test(d.name || '');
+    const name = document.createElement('div');
+    name.className = 'bt-name';
+    name.appendChild(document.createTextNode(isMacName ? 'неизвестное устройство' : (d.name || d.mac)));
+    if (d.connected) name.appendChild(btChip('подключено', 'conn'));
+    else if (d.paired) name.appendChild(btChip('сопряжено', 'pair'));
+    const mac = document.createElement('div');
+    mac.className = 'bt-mac';
+    mac.textContent = d.mac + (d.trusted ? ' · доверено' : '') + (d.sink ? ' · ' + d.sink.replace('bluez_sink.', '') : '');
+    main.appendChild(name);
+    main.appendChild(mac);
+
+    const actions = document.createElement('div');
+    actions.className = 'bt-actions';
+
+    const mkBtn = (label, handler, title) => {
+      const b = document.createElement('button');
+      b.className = 'btn small';
+      b.type = 'button';
+      b.textContent = label;
+      if (title) b.title = title;
+      b.addEventListener('click', handler);
+      if (btUi.busy) b.disabled = true;
+      actions.appendChild(b);
+      return b;
+    };
+
+    if (d.connected) {
+      mkBtn('Отключить', () => btAction('/api/bluetooth/disconnect', { mac: d.mac }, 'отключаю…'));
+    } else {
+      mkBtn(d.paired ? 'Подключить' : 'Подключить', () => btAction('/api/bluetooth/connect', { mac: d.mac }, 'подключаю…'),
+        d.paired ? '' : 'устройство не сопряжено — подключение запустит сопряжение');
+    }
+    if (d.sink) {
+      mkBtn('Сделать выводом', async () => {
+        const r = await postAudio('/api/audio/sink', { name: d.sink, setDefault: true, mute: false }, 'вывод переключён на ' + d.name);
+        if (r) await loadAudio($('source-select').value);
+      }, 'Сделать эту колонку устройством вывода по умолчанию');
+    }
+    if (d.connected && !d.sink) {
+      const hint = document.createElement('span');
+      hint.className = 'bt-chip';
+      hint.textContent = 'нет A2DP-профиля';
+      actions.appendChild(hint);
+    }
+
+    li.appendChild(main);
+    li.appendChild(actions);
+    return li;
+  }
+
+  function btRender(state) {
+    btUi.controller = state.controller;
+    btUi.devices = state.devices || [];
+    const ctl = state.controller;
+    if (ctl) {
+      $('bt-adapter').textContent = (ctl.alias || ctl.name || 'адаптер') + ' · ' + ctl.address + ' · ' + (ctl.powered ? 'включён' : 'выключен');
+      $('bt-hint').textContent = 'адаптер ' + (ctl.alias || ctl.name || '');
+      $('bt-power').textContent = ctl.powered ? 'Выключить' : 'Включить';
+      $('bt-scan').disabled = !ctl.powered || btUi.busy;
+    } else {
+      $('bt-adapter').textContent = 'адаптер не найден';
+      $('bt-scan').disabled = true;
+    }
+    const list = $('bt-list');
+    list.innerHTML = '';
+    if (!btUi.devices.length) {
+      const li = document.createElement('li');
+      li.className = 'bt-empty';
+      li.textContent = 'устройств нет — включите колонку и нажмите «Сканировать»';
+      list.appendChild(li);
+      return;
+    }
+    for (const d of btUi.devices.slice(0, 12)) list.appendChild(btRenderDevice(d));
+  }
+
+  async function loadBt() {
+    try {
+      const r = await fetch('/api/bluetooth', { cache: 'no-store' });
+      const d = await r.json();
+      if (d.error) { $('bt-info').textContent = d.error; return; }
+      btRender(d);
+    } catch (e) {
+      $('bt-info').textContent = 'не удалось прочитать состояние: ' + e.message;
+    }
+  }
+
+  function btErrorText(err) {
+    if (/page-timeout/i.test(err)) return 'не удалось подключиться: устройство не отвечает (выключено или вне зоны)';
+    if (/AlreadyConnected/i.test(err)) return 'устройство уже подключено';
+    if (/not available/i.test(err)) return 'адаптер недоступен';
+    return err;
+  }
+
+  async function btAction(path, body, busyText) {
+    if (btUi.busy) return;
+    btUi.busy = true;
+    $('bt-info').textContent = busyText || '…';
+    try {
+      const r = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {}),
+      });
+      const d = await r.json();
+      if (d.error) { $('bt-info').textContent = btErrorText(d.error); }
+      else {
+        $('bt-info').textContent = d.warning || (body && body.mac ? 'готово: ' + (body.mac || '') : 'готово');
+        if (d.devices) btRender(d);
+      }
+    } catch (e) {
+      $('bt-info').textContent = 'ошибка: ' + e.message;
+    } finally {
+      btUi.busy = false;
+      loadBt();
+    }
+  }
+
+  $('bt-refresh').addEventListener('click', () => loadBt());
+
+  $('bt-power').addEventListener('click', () => {
+    const on = !(btUi.controller && btUi.controller.powered);
+    btAction('/api/bluetooth/power', { on: on }, on ? 'включаю адаптер…' : 'выключаю адаптер…');
+  });
+
+  $('bt-scan').addEventListener('click', async () => {
+    if (btUi.busy) return;
+    btUi.busy = true;
+    $('bt-info').textContent = 'сканирую 8 секунд…';
+    try {
+      const r = await fetch('/api/bluetooth/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ seconds: 8 }),
+      });
+      const d = await r.json();
+      if (d.error) $('bt-info').textContent = d.error;
+      else { $('bt-info').textContent = 'найдено устройств: ' + (d.devices || []).length; btRender(d); }
+    } catch (e) {
+      $('bt-info').textContent = 'ошибка сканирования: ' + e.message;
+    } finally {
+      btUi.busy = false;
+      loadBt();
+    }
+  });
+
+  function btStartPolling() {
+    if (btUi.timer) clearInterval(btUi.timer);
+    btUi.timer = setInterval(() => {
+      if (document.visibilityState === 'visible' && !btUi.busy) loadBt();
+    }, 12000);
+  }
+
   /* ---------- старт ---------- */
   async function init() {
     fitCanvases();
@@ -892,6 +1059,8 @@
       await loadAsr();
       await loadTts();
       await loadAudio(pick);
+      await loadBt();
+      btStartPolling();
       connect(pick);
     } catch (e) {
       subtitle.textContent = 'ошибка подключения: ' + e.message;

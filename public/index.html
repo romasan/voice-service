@@ -157,6 +157,26 @@
     <div class="muted small" id="audio-info"></div>
   </section>
 
+  <section class="sec">
+    <h2>Bluetooth <span class="hint" id="bt-hint">адаптер node1</span></h2>
+    <div class="audio-grid">
+      <div class="audio-block">
+        <div class="audio-head">Адаптер</div>
+        <div class="bt-adapter" id="bt-adapter">—</div>
+        <div class="row">
+          <button class="btn small" id="bt-scan" type="button">Сканировать</button>
+          <button class="btn small" id="bt-power" type="button">Выключить</button>
+          <button class="btn small" id="bt-refresh" type="button">Обновить</button>
+        </div>
+        <div class="muted small" id="bt-info"></div>
+      </div>
+      <div class="audio-block">
+        <div class="audio-head">Устройства</div>
+        <ul class="bt-list" id="bt-list"></ul>
+      </div>
+    </div>
+  </section>
+
 </main>
 <audio id="player" preload="none"></audio>
 <script src="/app.js"></script>

@@ -1039,6 +1039,84 @@ function playTestTone(sink, cb) {
   });
 }
 
+/* ---------- Bluetooth ---------- */
+function btRun(args, timeoutMs, cb) {
+  const proc = spawn('bluetoothctl', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = '';
+  const collect = (d) => { out += d.toString(); };
+  proc.stdout.on('data', collect);
+  proc.stderr.on('data', collect);
+  const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch (e) { /* ignore */ } }, timeoutMs || 30000);
+  proc.on('error', (e) => { clearTimeout(timer); cb(e); });
+  proc.on('exit', (code) => { clearTimeout(timer); cb(null, { code: code, out: out }); });
+}
+
+function btField(txt, key) {
+  const m = txt.match(new RegExp('\\t' + key + ':\\s*(.+)'));
+  return m ? m[1].trim() : '';
+}
+
+function btInfoSync(mac) {
+  let txt = '';
+  try { txt = execFileSync('bluetoothctl', ['info', mac], { timeout: 8000 }).toString(); } catch (e) { return null; }
+  if (!/Device\s+[0-9A-F:]{17}/i.test(txt)) return null;
+  const rssiRaw = btField(txt, 'RSSI');
+  const rssi = rssiRaw ? parseInt(rssiRaw, 16) : null;
+  return {
+    mac: mac,
+    name: btField(txt, 'Alias') || btField(txt, 'Name') || mac,
+    connected: btField(txt, 'Connected') === 'yes',
+    paired: btField(txt, 'Paired') === 'yes',
+    trusted: btField(txt, 'Trusted') === 'yes',
+    icon: btField(txt, 'Icon'),
+    rssi: rssi && rssi < 0 ? rssi : null,
+  };
+}
+
+function btSinks() {
+  const map = {};
+  let out = '';
+  try { out = execFileSync('pactl', ['list', 'short', 'sinks'], { timeout: 5000 }).toString(); } catch (e) { return map; }
+  for (const line of out.split('\n')) {
+    const parts = line.split('\t');
+    const name = parts[1] || '';
+    const m = name.match(/^bluez_sink\.([0-9a-f_]+)\./);
+    if (m) map[m[1].replace(/_/g, ':').toLowerCase()] = name;
+  }
+  return map;
+}
+
+function btState() {
+  let controller = null;
+  try {
+    const show = execFileSync('bluetoothctl', ['show'], { timeout: 8000 }).toString();
+    controller = {
+      address: (show.match(/Controller\s+([0-9A-F:]{17})/i) || [])[1] || '',
+      name: btField(show, 'Name'),
+      alias: btField(show, 'Alias'),
+      powered: btField(show, 'Powered') === 'yes',
+      discoverable: btField(show, 'Discoverable') === 'yes',
+      discovering: btField(show, 'Discovering') === 'yes',
+    };
+  } catch (e) {
+    controller = null;
+  }
+  let devices = [];
+  try {
+    const txt = execFileSync('bluetoothctl', ['devices'], { timeout: 8000 }).toString();
+    for (const line of txt.split('\n')) {
+      const m = line.match(/^Device\s+([0-9A-F:]{17})\s+(.*)$/i);
+      if (!m) continue;
+      const info = btInfoSync(m[1].toUpperCase());
+      devices.push(info || { mac: m[1].toUpperCase(), name: m[2], connected: false, paired: false, trusted: false });
+    }
+  } catch (e) { /* ignore */ }
+  const sinks = btSinks();
+  for (const d of devices) d.sink = sinks[d.mac.toLowerCase()] || null;
+  devices.sort((a, b) => (Number(b.connected) - Number(a.connected)) || (Number(b.paired) - Number(a.paired)) || a.name.localeCompare(b.name));
+  return { controller: controller, devices: devices, sinks: Object.values(sinks) };
+}
+
 /* ---------- HTTP ---------- */
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://' + (req.headers.host || 'localhost'));
@@ -1156,6 +1234,80 @@ const server = http.createServer((req, res) => {
         saveHistory();
         broadcast('history', { cleared: false });
         sendJson(res, { ok: true });
+      });
+    }
+    if (p === '/api/bluetooth') {
+      try {
+        return sendJson(res, btState());
+      } catch (e) {
+        return sendJson(res, { error: e.message }, 500);
+      }
+    }
+    if (p === '/api/bluetooth/scan') {
+      if (method !== 'POST') return sendJson(res, { error: 'POST required' }, 405);
+      return readBody(req, (err, body) => {
+        if (err) return sendJson(res, { error: 'bad json' }, 400);
+        const seconds = clamp((body && body.seconds) || 8, 3, 20);
+        btRun(['--timeout', String(seconds), 'scan', 'on'], (seconds + 8) * 1000, (err2) => {
+          if (err2) return sendJson(res, { error: err2.message }, 500);
+          try { sendJson(res, Object.assign({ ok: true }, btState())); } catch (e) { sendJson(res, { error: e.message }, 500); }
+        });
+      });
+    }
+    if (p === '/api/bluetooth/connect' || p === '/api/bluetooth/disconnect') {
+      if (method !== 'POST') return sendJson(res, { error: 'POST required' }, 405);
+      const action = p.endsWith('connect') ? 'connect' : 'disconnect';
+      return readBody(req, (err, body) => {
+        if (err) return sendJson(res, { error: 'bad json' }, 400);
+        const mac = String((body && body.mac) || '').toUpperCase();
+        if (!/^[0-9A-F:]{17}$/.test(mac)) return sendJson(res, { error: 'неверный MAC' }, 400);
+        btRun([action, mac], 30000, (err2, r2) => {
+          if (err2) return sendJson(res, { error: err2.message }, 500);
+          const rawLog = String(r2.out || '');
+          const failed = /Failed to (connect|disconnect)/i.test(rawLog) || /not available/i.test(rawLog);
+          setTimeout(() => {
+            let state;
+            try { state = btState(); } catch (e) { return sendJson(res, { error: e.message }, 500); }
+            const dev = (state.devices || []).find((d) => d.mac === mac);
+            let warning = null;
+            if (action === 'connect' && dev && dev.connected && !dev.sink) {
+              warning = 'устройство подключено, но sink A2DP не появился — профиль мог занять greeter (см. AGENTS.md)';
+            }
+            const ok = !failed && (action === 'disconnect' ? !(dev && dev.connected) : !!(dev && dev.connected));
+            const errorLine = failed ? (rawLog.match(/Failed to [^\n]+/) || ['не удалось подключиться'])[0] : null;
+            sendJson(res, Object.assign({
+              ok: ok,
+              error: ok ? undefined : (errorLine || 'устройство не подключилось'),
+              action: action,
+              warning: warning,
+              log: rawLog.trim().split('\n').slice(-4),
+            }, state));
+          }, 1500);
+        });
+      });
+    }
+    if (p === '/api/bluetooth/trust') {
+      if (method !== 'POST') return sendJson(res, { error: 'POST required' }, 405);
+      return readBody(req, (err, body) => {
+        if (err) return sendJson(res, { error: 'bad json' }, 400);
+        const mac = String((body && body.mac) || '').toUpperCase();
+        if (!/^[0-9A-F:]{17}$/.test(mac)) return sendJson(res, { error: 'неверный MAC' }, 400);
+        const cmd = body && body.value === false ? 'untrust' : 'trust';
+        btRun([cmd, mac], 15000, (err2) => {
+          if (err2) return sendJson(res, { error: err2.message }, 500);
+          try { sendJson(res, Object.assign({ ok: true }, btState())); } catch (e) { sendJson(res, { error: e.message }, 500); }
+        });
+      });
+    }
+    if (p === '/api/bluetooth/power') {
+      if (method !== 'POST') return sendJson(res, { error: 'POST required' }, 405);
+      return readBody(req, (err, body) => {
+        if (err) return sendJson(res, { error: 'bad json' }, 400);
+        const on = !(body && body.on === false);
+        btRun(['power', on ? 'on' : 'off'], 15000, (err2) => {
+          if (err2) return sendJson(res, { error: err2.message }, 500);
+          try { sendJson(res, Object.assign({ ok: true }, btState())); } catch (e) { sendJson(res, { error: e.message }, 500); }
+        });
       });
     }
     if (p === '/api/audio') {
