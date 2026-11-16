@@ -214,6 +214,8 @@
         if (d.enabled) hintEl.textContent = 'распознаю…';
       } else if (d.type === 'final') {
         partialEl.textContent = d.text || '—';
+      } else if (d.type === 'followup-heard') {
+        hintEl.textContent = 'продолжение: «' + d.text + '»';
       } else if (d.type === 'wake') {
         hintEl.textContent = 'обращение услышано — говорите команду';
       } else if (d.type === 'ignored') {
@@ -249,6 +251,9 @@
         llmUi.busy = false;
         llmUi.error = d.error;
         $('llm-status').textContent = 'ошибка: ' + d.error;
+      } else if (d.type === 'followup') {
+        llmUi.followUntil = d.until || 0;
+        $('llm-status').textContent = 'слушаю продолжение диалога — можно без обращения';
       } else if (d.type === 'busy') {
         $('llm-status').textContent = 'уже отвечаю…';
       } else if (d.type === 'reset') {
@@ -449,6 +454,10 @@
 
   function hintIdle() {
     if (!asrUi.enabled) { hintEl.textContent = 'распознавание выключено'; return; }
+    if (llmUi.followUntil && Date.now() < llmUi.followUntil) {
+      hintEl.textContent = 'можно продолжать диалог без обращения';
+      return;
+    }
     hintEl.textContent = 'скажите «' + wakeWord() + '», затем команду';
   }
 
@@ -841,7 +850,7 @@
   });
 
   /* ---------- LLM ---------- */
-  const llmUi = { enabled: false, model: '', busy: false, speaking: false, answer: '', error: null };
+  const llmUi = { enabled: false, model: '', busy: false, speaking: false, answer: '', error: null, followUntil: 0 };
 
   function llmBadge() {
     const b = $('llm-badge');
@@ -850,6 +859,7 @@
     if (llmUi.error) { cls = 'error'; label = 'ошибка'; }
     else if (!llmUi.enabled) { cls = 'off'; label = 'выкл'; }
     else if (llmUi.busy) { cls = 'armed'; label = 'думает'; }
+    else if (llmUi.followUntil && Date.now() < llmUi.followUntil) { cls = 'armed'; label = 'ждёт продолжения'; }
     else if (llmUi.speaking) { cls = 'ready'; label = 'говорит'; }
     else { cls = 'ready'; label = 'готов'; }
     b.className = 'badge ' + cls;
@@ -865,6 +875,8 @@
     $('llm-thinking').checked = !!cfg.thinking;
     $('llm-stream').checked = cfg.stream !== false;
     $('llm-max').value = cfg.maxTokens || 300;
+    $('llm-follow').checked = !!cfg.followUp;
+    $('llm-follow-sec').value = cfg.followUpSeconds || 10;
     $('llm-system').value = cfg.systemPrompt || '';
     if ($('llm-model').options.length) $('llm-model').value = llmUi.model;
     llmBadge();
@@ -918,6 +930,8 @@
       thinking: $('llm-thinking').checked,
       stream: $('llm-stream').checked,
       maxTokens: Number($('llm-max').value) || 300,
+      followUp: $('llm-follow').checked,
+      followUpSeconds: Number($('llm-follow-sec').value) || 10,
       systemPrompt: $('llm-system').value,
     };
     try {

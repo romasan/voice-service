@@ -391,6 +391,8 @@ function defaultCfg() {
       thinking: false,
       stream: true,
       maxTokens: 300,
+      followUp: false,
+      followUpSeconds: 10,
       systemPrompt: LLM_DEFAULT_PROMPT,
     },
   };
@@ -551,6 +553,7 @@ function asrState() {
     error: asr.error,
     speaking: !!asr.speaking,
     vad: !!cfg.asr.vad && vadAvailable(),
+    followingUp: followUpActive(),
   };
 }
 
@@ -681,16 +684,27 @@ function pushCommand(text, viaWake) {
   const item = addHistory(text, { viaWake: !!viaWake, source: 'vosk' });
   broadcast('cmd', { item });
   broadcast('asr', Object.assign({ type: 'idle' }, asrState()));
-  if (cfg.llm.enabled) respondWithLlm(text);
+  if (cfg.llm.enabled) {
+    llm.followUntil = 0;
+    respondWithLlm(text);
+  }
 }
 
 function handleUtterance(rawText) {
   const text = normText(rawText);
   if (!text) return;
+  // не слушаем собственный синтез и не мешаем идущему ответу
+  if (asr.enabled && (llm.speaking || llm.queue.length)) return;
   const words = text.split(' ');
   broadcast('asr', Object.assign({ type: 'final', text: text, ts: Date.now() }, asrState()));
 
   if (!cfg.asr.requireWake) {
+    pushCommand(text, false);
+    return;
+  }
+  if (!asr.armed && followUpActive()) {
+    // окно продолжения диалога: слово-обращение не нужно
+    broadcast('asr', Object.assign({ type: 'followup-heard', text: text }, asrState()));
     pushCommand(text, false);
     return;
   }
@@ -1289,6 +1303,7 @@ const llm = {
   history: [],
   queue: [], speaking: false,
   busy: false, lastError: null,
+  followUntil: 0,
 };
 
 function llmKey() {
@@ -1364,8 +1379,20 @@ function enqueueSpeech(text) {
   pumpSpeech();
 }
 
+function armFollowUp() {
+  if (!cfg.llm.enabled || !cfg.llm.followUp) return;
+  llm.followUntil = Date.now() + clamp(cfg.llm.followUpSeconds, 3, 60) * 1000;
+  broadcast('llm', { type: 'followup', until: llm.followUntil });
+  broadcast('asr', Object.assign({ type: 'followup' }, asrState()));
+}
+
+function followUpActive() {
+  return !!(cfg.llm.enabled && cfg.llm.followUp && Date.now() < llm.followUntil);
+}
+
 function pumpSpeech() {
-  if (llm.speaking || !llm.queue.length) return;
+  if (llm.speaking) return;
+  if (!llm.queue.length) { armFollowUp(); return; }
   const text = llm.queue.shift();
   const opts = currentTtsOpts();
   if (!opts) { broadcast('llm', { type: 'tts-error', error: 'TTS не настроен' }); pumpSpeech(); return; }
@@ -1491,6 +1518,7 @@ function respondWithLlm(text) {
       return;
     }
     broadcast('llm', { type: 'done', text: result.text, finish: result.finish, usage: result.usage });
+    if (!llm.speaking && !llm.queue.length) armFollowUp();
   });
 }
 
@@ -1701,6 +1729,8 @@ const server = http.createServer((req, res) => {
           config: cfg.llm,
           busy: llm.busy,
           speaking: llm.speaking,
+          followingUp: followUpActive(),
+          followUntil: llm.followUntil,
           history: llm.history.length,
         });
       });
@@ -1715,6 +1745,8 @@ const server = http.createServer((req, res) => {
         if (body.thinking !== undefined) l.thinking = !!body.thinking;
         if (body.stream !== undefined) l.stream = !!body.stream;
         if (body.maxTokens !== undefined) l.maxTokens = clamp(body.maxTokens, 16, 8192);
+        if (body.followUp !== undefined) l.followUp = !!body.followUp;
+        if (body.followUpSeconds !== undefined) l.followUpSeconds = clamp(body.followUpSeconds, 3, 60);
         if (body.systemPrompt !== undefined) l.systemPrompt = String(body.systemPrompt).slice(0, 8000);
         saveCfg();
         broadcast('llm', { type: 'config', config: cfg.llm });
