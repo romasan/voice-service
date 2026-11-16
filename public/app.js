@@ -236,6 +236,7 @@
       const d = JSON.parse(e.data);
       if (d.type === 'start') {
         llmUi.busy = true;
+        llmUi.speaking = false;
         llmUi.answer = '';
         $('llm-prompt').textContent = 'Вы: ' + (d.prompt || '');
         llmShowAnswer('');
@@ -252,9 +253,11 @@
         $('llm-status').textContent = 'проговариваю: ' + (d.text || '').slice(0, 60);
       } else if (d.type === 'error') {
         llmUi.busy = false;
+        llmUi.speaking = false;
         llmUi.error = d.error;
         $('llm-status').textContent = 'ошибка: ' + d.error;
       } else if (d.type === 'followup') {
+        llmUi.speaking = false;
         llmUi.followUntil = d.until || 0;
         $('llm-status').textContent = 'слушаю продолжение диалога — можно без обращения';
       } else if (d.type === 'stopped') {
@@ -1354,6 +1357,17 @@
     }
   });
 
+  function startLlmClocks() {
+    setInterval(() => {
+      if (llmUi.followUntil && Date.now() >= llmUi.followUntil) {
+        llmUi.followUntil = 0;
+        llmBadge();
+        $('llm-status').textContent = '';
+        hintIdle();
+      }
+    }, 1000);
+  }
+
   function btStartPolling() {
     if (btUi.timer) clearInterval(btUi.timer);
     btUi.timer = setInterval(() => {
@@ -1383,6 +1397,7 @@
       await loadAsr();
       await loadTts();
       await loadLlm();
+      startLlmClocks();
       await loadAudio(pick);
       await loadBt();
       btStartPolling();
