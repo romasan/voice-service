@@ -962,6 +962,19 @@
 
   $('llm-form').addEventListener('submit', (ev) => { ev.preventDefault(); saveLlm(); });
 
+  $('llm-stop').addEventListener('click', async () => {
+    try {
+      await fetch('/api/llm/stop', { method: 'POST' });
+      llmUi.busy = false;
+      llmUi.speaking = false;
+      llmUi.followUntil = 0;
+      $('llm-status').textContent = 'остановлено';
+      llmBadge();
+    } catch (e) {
+      $('llm-status').textContent = 'ошибка: ' + e.message;
+    }
+  });
+
   $('llm-reset').addEventListener('click', async () => {
     await fetch('/api/llm/reset', { method: 'POST' }).catch(() => {});
     llmShowAnswer('');

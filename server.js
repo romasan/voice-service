@@ -703,6 +703,11 @@ function handleUtterance(rawText) {
   }
   // не слушаем собственный синтез и не мешаем идущему ответу
   if (asr.enabled && (llm.speaking || llm.queue.length)) return;
+  // хвост собственной речи сразу после ответа: похоже на эхо — игнорируем
+  if (Date.now() < llm.echoGuardUntil && looksLikeEcho(text)) {
+    broadcast('asr', Object.assign({ type: 'ignored', text: text, echo: true }, asrState()));
+    return;
+  }
   broadcast('asr', Object.assign({ type: 'final', text: text, ts: Date.now() }, asrState()));
 
   if (!cfg.asr.requireWake) {
@@ -1315,6 +1320,7 @@ const llm = {
   busy: false, lastError: null,
   followUntil: 0,
   activeReq: null, stoppedAt: 0, gen: 0,
+  spokenText: '', echoGuardUntil: 0,
 };
 
 const ttsPlayer = { proc: null, token: 0 };
@@ -1394,9 +1400,20 @@ function enqueueSpeech(text) {
   pumpSpeech();
 }
 
+function looksLikeEcho(text) {
+  const words = normText(text).split(' ').filter((w) => w.length > 3);
+  if (!words.length) return false;
+  const spoken = new Set(normText(llm.spokenText).split(' ').filter((w) => w.length > 3));
+  if (!spoken.size) return false;
+  let hit = 0;
+  for (const w of words) if (spoken.has(w)) hit += 1;
+  return hit / words.length >= 0.6;
+}
+
 function armFollowUp() {
   if (!cfg.llm.enabled || !cfg.llm.followUp) return;
   if (Date.now() - llm.stoppedAt < 1500) return;
+  llm.echoGuardUntil = Date.now() + 1000;
   llm.followUntil = Date.now() + clamp(cfg.llm.followUpSeconds, 3, 60) * 1000;
   broadcast('llm', { type: 'followup', until: llm.followUntil });
   broadcast('asr', Object.assign({ type: 'followup' }, asrState()));
@@ -1416,6 +1433,8 @@ function stopDialog(reason) {
   llm.queue = [];
   llm.speaking = false;
   llm.followUntil = 0;
+  llm.spokenText = '';
+  llm.echoGuardUntil = 0;
   llm.history = [];
   llm.busy = false;
   llm.stoppedAt = Date.now();
@@ -1439,7 +1458,10 @@ function pumpSpeech() {
   synthesize(text, opts, (err, info) => {
     llm.speaking = false;
     if (err && err.message !== 'остановлено') broadcast('llm', { type: 'tts-error', error: err.message });
-    else broadcast('llm', { type: 'speaking', text: text, url: info.url, duration: info.duration });
+    else {
+      llm.spokenText = (llm.spokenText + ' ' + text).slice(-400);
+      broadcast('llm', { type: 'speaking', text: text, url: info.url, duration: info.duration });
+    }
     pumpSpeech();
   }, playToken);
 }
@@ -1812,6 +1834,7 @@ const server = http.createServer((req, res) => {
         llmChat(text, (err2, result) => {
           llm.busy = false;
           if (result && result.stopped) return sendJson(res, { ok: true, stopped: true, text: '' });
+          if (err2 && Date.now() - llm.stoppedAt < 3000) return sendJson(res, { ok: true, stopped: true, text: '' });
           if (err2) {
             llm.lastError = err2.message;
             broadcast('llm', { type: 'error', error: err2.message });
@@ -1821,6 +1844,11 @@ const server = http.createServer((req, res) => {
           sendJson(res, { ok: true, text: result.text, reasoning: result.reasoning, finish: result.finish, usage: result.usage });
         });
       });
+    }
+    if (p === '/api/llm/stop') {
+      if (method !== 'POST') return sendJson(res, { error: 'POST required' }, 405);
+      stopDialog('кнопка Стоп');
+      return sendJson(res, { ok: true, stopped: true });
     }
     if (p === '/api/llm/reset') {
       llm.history = [];
