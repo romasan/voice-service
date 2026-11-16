@@ -214,6 +214,9 @@
         if (d.enabled) hintEl.textContent = 'распознаю…';
       } else if (d.type === 'final') {
         partialEl.textContent = d.text || '—';
+      } else if (d.type === 'stop') {
+        partialEl.textContent = '—';
+        hintEl.textContent = 'диалог остановлен';
       } else if (d.type === 'followup-heard') {
         hintEl.textContent = 'продолжение: «' + d.text + '»';
       } else if (d.type === 'wake') {
@@ -254,6 +257,11 @@
       } else if (d.type === 'followup') {
         llmUi.followUntil = d.until || 0;
         $('llm-status').textContent = 'слушаю продолжение диалога — можно без обращения';
+      } else if (d.type === 'stopped') {
+        llmUi.busy = false;
+        llmUi.speaking = false;
+        llmUi.followUntil = 0;
+        $('llm-status').textContent = 'остановлено';
       } else if (d.type === 'busy') {
         $('llm-status').textContent = 'уже отвечаю…';
       } else if (d.type === 'reset') {
@@ -570,6 +578,7 @@
       if (d.config) {
         if (d.config.model) sel.value = d.config.model;
         wakeInput.value = d.config.wakeWord || '';
+        $('asr-stop').value = d.config.stopWord || '';
         $('asr-silence').value = d.config.silenceMs || 1200;
         $('asr-require').checked = d.config.requireWake !== false;
         $('asr-vad').checked = d.config.vad !== false;
@@ -609,6 +618,7 @@
     const body = {
       model: $('asr-model').value,
       wakeWord: wakeInput.value.trim(),
+      stopWord: $('asr-stop').value.trim(),
       requireWake: $('asr-require').checked,
       silenceMs: Number($('asr-silence').value) || 1200,
       vad: $('asr-vad').checked,

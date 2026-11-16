@@ -378,7 +378,7 @@ const LLM_DEFAULT_PROMPT = 'Ты голосовой ассистент.\nОтв�
 
 function defaultCfg() {
   return {
-    asr: { model: '', wakeWord: 'антон', requireWake: true, silenceMs: 1200, vad: true, vadThreshold: 0.5 },
+    asr: { model: '', wakeWord: 'антон', stopWord: 'стоп', requireWake: true, silenceMs: 1200, vad: true, vadThreshold: 0.5 },
     tts: {
       engine: 'espeak',
       espeak: { voice: 'ru', speed: 150, pitch: 50, amplitude: 100 },
@@ -693,9 +693,16 @@ function pushCommand(text, viaWake) {
 function handleUtterance(rawText) {
   const text = normText(rawText);
   if (!text) return;
+  const words = text.split(' ');
+  const wakeIdx = wakeIndex(words, cfg.asr.wakeWord);
+  const stopIdx = cfg.asr.stopWord ? wakeIndex(words, cfg.asr.stopWord) : -1;
+  // «<обращение> <стоп-слово>» прерывает текущий ответ в любой момент
+  if (wakeIdx >= 0 && stopIdx > wakeIdx) {
+    stopDialog('стоп-слово: ' + text);
+    return;
+  }
   // не слушаем собственный синтез и не мешаем идущему ответу
   if (asr.enabled && (llm.speaking || llm.queue.length)) return;
-  const words = text.split(' ');
   broadcast('asr', Object.assign({ type: 'final', text: text, ts: Date.now() }, asrState()));
 
   if (!cfg.asr.requireWake) {
@@ -709,13 +716,12 @@ function handleUtterance(rawText) {
     return;
   }
   if (!asr.armed) {
-    const idx = wakeIndex(words, cfg.asr.wakeWord);
-    if (idx < 0) {
+    if (wakeIdx < 0) {
       broadcast('asr', Object.assign({ type: 'ignored', text: text }, asrState()));
       return;
     }
     asr.armed = true;
-    asr.cmd = words.slice(idx + 1).join(' ');
+    asr.cmd = words.slice(wakeIdx + 1).join(' ');
     broadcast('asr', Object.assign({ type: 'wake', text: text }, asrState()));
     if (asr.cmd) scheduleFinalize(); else scheduleDisarm();
     return;
@@ -779,13 +785,17 @@ function wavDuration(file) {
   } catch (e) { return 0; }
 }
 
-function playWav(file, cb) {
+function playWav(file, cb, playToken) {
+  const token = playToken != null ? playToken : ttsPlayer.token;
   execFile('pactl', ['get-sink-mute', '@DEFAULT_SINK@'], { env: Object.assign({}, process.env, { LC_ALL: 'C' }), timeout: 5000 }, (err, stdout) => {
     const muted = !err && /yes/i.test(stdout);
     const start = () => {
+      if (token !== ttsPlayer.token) return cb(new Error('остановлено'));
       const p = spawn('paplay', [file], { stdio: 'ignore' });
+      ttsPlayer.proc = p;
       p.on('error', (e) => cb(e));
       p.on('exit', () => {
+        if (ttsPlayer.proc === p) ttsPlayer.proc = null;
         if (muted) execFile('pactl', ['set-sink-mute', '@DEFAULT_SINK@', '1'], () => {});
         cb(null);
       });
@@ -985,7 +995,7 @@ function runRhvoice(text, opts, file, cb) {
   proc.stdin.end(text);
 }
 
-function synthesize(text, opts, cb) {
+function synthesize(text, opts, cb, playToken) {
   const engine = opts.engine === 'rhvoice' ? 'rhvoice' : opts.engine === 'piper' ? 'piper' : 'espeak';
   const name = 'tts-' + timestampName() + '.wav';
   const file = path.join(TTS_DIR, name);
@@ -1006,7 +1016,7 @@ function synthesize(text, opts, cb) {
       info.played = !perr;
       info.playError = perr ? perr.message : null;
       cb(null, info);
-    });
+    }, playToken);
   };
   if (engine === 'rhvoice') runRhvoice(text, opts, file, finish);
   else if (engine === 'piper') runPiper(text, opts, file, finish);
@@ -1304,7 +1314,10 @@ const llm = {
   queue: [], speaking: false,
   busy: false, lastError: null,
   followUntil: 0,
+  activeReq: null, stoppedAt: 0, gen: 0,
 };
+
+const ttsPlayer = { proc: null, token: 0 };
 
 function llmKey() {
   return process.env.LLM_API_KEY || null;
@@ -1337,6 +1350,8 @@ function llmRequest(method, pathName, bodyObj, onResponse, onError) {
     }
     onResponse(res);
   });
+  llm.activeReq = req;
+  req.on('close', () => { if (llm.activeReq === req) llm.activeReq = null; });
   req.on('timeout', () => { req.destroy(new Error('таймаут запроса к LLM')); });
   req.on('error', onError);
   if (payload) req.write(payload);
@@ -1381,6 +1396,7 @@ function enqueueSpeech(text) {
 
 function armFollowUp() {
   if (!cfg.llm.enabled || !cfg.llm.followUp) return;
+  if (Date.now() - llm.stoppedAt < 1500) return;
   llm.followUntil = Date.now() + clamp(cfg.llm.followUpSeconds, 3, 60) * 1000;
   broadcast('llm', { type: 'followup', until: llm.followUntil });
   broadcast('asr', Object.assign({ type: 'followup' }, asrState()));
@@ -1390,6 +1406,28 @@ function followUpActive() {
   return !!(cfg.llm.enabled && cfg.llm.followUp && Date.now() < llm.followUntil);
 }
 
+function stopDialog(reason) {
+  llm.gen += 1;
+  ttsPlayer.token += 1;
+  if (ttsPlayer.proc) {
+    try { ttsPlayer.proc.kill('SIGTERM'); } catch (e) { /* ignore */ }
+    ttsPlayer.proc = null;
+  }
+  llm.queue = [];
+  llm.speaking = false;
+  llm.followUntil = 0;
+  llm.history = [];
+  llm.busy = false;
+  llm.stoppedAt = Date.now();
+  if (llm.activeReq) {
+    try { llm.activeReq.destroy(); } catch (e) { /* ignore */ }
+    llm.activeReq = null;
+  }
+  console.log('[voice-service] диалог остановлен:', reason || 'stop-word');
+  broadcast('llm', { type: 'stopped', reason: reason || 'stop-word' });
+  broadcast('asr', Object.assign({ type: 'stop' }, asrState()));
+}
+
 function pumpSpeech() {
   if (llm.speaking) return;
   if (!llm.queue.length) { armFollowUp(); return; }
@@ -1397,12 +1435,13 @@ function pumpSpeech() {
   const opts = currentTtsOpts();
   if (!opts) { broadcast('llm', { type: 'tts-error', error: 'TTS не настроен' }); pumpSpeech(); return; }
   llm.speaking = true;
+  const playToken = ttsPlayer.token;
   synthesize(text, opts, (err, info) => {
     llm.speaking = false;
-    if (err) broadcast('llm', { type: 'tts-error', error: err.message });
+    if (err && err.message !== 'остановлено') broadcast('llm', { type: 'tts-error', error: err.message });
     else broadcast('llm', { type: 'speaking', text: text, url: info.url, duration: info.duration });
     pumpSpeech();
-  });
+  }, playToken);
 }
 
 function takeSentences(state) {
@@ -1421,6 +1460,7 @@ function takeSentences(state) {
 
 /* ---------- чат ---------- */
 function llmChat(userText, cb) {
+  const gen = llm.gen;
   const body = {
     model: cfg.llm.model,
     messages: [{ role: 'system', content: cfg.llm.systemPrompt || LLM_DEFAULT_PROMPT }]
@@ -1436,6 +1476,7 @@ function llmChat(userText, cb) {
       let raw = '';
       res.on('data', (d) => { raw += d.toString(); });
       res.on('end', () => {
+        if (llm.gen !== gen) return cb(null, { text: '', stopped: true });
         try {
           const d = JSON.parse(raw);
           const msg = d.choices && d.choices[0] && d.choices[0].message;
@@ -1460,6 +1501,7 @@ function llmChat(userText, cb) {
     res.setEncoding('utf8');
     let rest = '';
     res.on('data', (chunk) => {
+      if (llm.gen !== gen) return;
       rest += chunk;
       let nl;
       while ((nl = rest.indexOf('\n')) >= 0) {
@@ -1488,6 +1530,7 @@ function llmChat(userText, cb) {
       }
     });
     res.on('end', () => {
+      if (llm.gen !== gen) return cb(null, { text: '', stopped: true });
       const tail = state.buf.trim();
       if (tail) enqueueSpeech(tail);
       state.buf = '';
@@ -1512,7 +1555,9 @@ function respondWithLlm(text) {
   broadcast('llm', { type: 'start', prompt: text });
   llmChat(text, (err, result) => {
     llm.busy = false;
+    if (result && result.stopped) return;
     if (err) {
+      if (Date.now() - llm.stoppedAt < 3000) return;
       llm.lastError = err.message;
       broadcast('llm', { type: 'error', error: err.message });
       return;
@@ -1612,6 +1657,7 @@ const server = http.createServer((req, res) => {
         const a = cfg.asr;
         if (body.model !== undefined) a.model = String(body.model);
         if (body.wakeWord !== undefined) a.wakeWord = String(body.wakeWord).slice(0, 64);
+        if (body.stopWord !== undefined) a.stopWord = String(body.stopWord).slice(0, 64);
         if (body.requireWake !== undefined) a.requireWake = !!body.requireWake;
         if (body.silenceMs !== undefined) a.silenceMs = clamp(body.silenceMs, 300, 5000);
         if (body.vad !== undefined) a.vad = !!body.vad;
@@ -1765,6 +1811,7 @@ const server = http.createServer((req, res) => {
         broadcast('llm', { type: 'start', prompt: text });
         llmChat(text, (err2, result) => {
           llm.busy = false;
+          if (result && result.stopped) return sendJson(res, { ok: true, stopped: true, text: '' });
           if (err2) {
             llm.lastError = err2.message;
             broadcast('llm', { type: 'error', error: err2.message });
