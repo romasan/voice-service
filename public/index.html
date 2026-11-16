@@ -157,30 +157,35 @@
       <div class="llm-text" id="llm-text">Ответ появится здесь</div>
     </div>
 
-    <form id="llm-form" class="formgrid">
-      <label class="llm-model-label">Модель
-        <select id="llm-model"></select>
-      </label>
-      <label>max_tokens
-        <input id="llm-max" type="number" min="16" max="8192" step="8" value="300">
-      </label>
-      <label class="chk"><input id="llm-thinking" type="checkbox"><span>thinking</span></label>
-      <label class="chk"><input id="llm-stream" type="checkbox" checked><span>stream</span></label>
-      <label class="chk" title="После ответа сервис ещё слушает микрофон — продолжать диалог можно без слова-обращения">
-        <input id="llm-follow" type="checkbox">
-        <span>продолжать диалог без обращения</span>
-      </label>
-      <label>Окно, с
-        <input id="llm-follow-sec" type="number" min="3" max="60" step="1" value="10">
-      </label>
-      <button type="submit" class="btn small">Сохранить</button>
-      <button type="button" class="btn small" id="llm-reset">Новый диалог</button>
-      <span id="llm-saved" class="muted small"></span>
-    </form>
+    <form id="llm-form">
+      <div class="formgrid">
+        <label class="llm-model-label">Модель
+          <select id="llm-model"></select>
+        </label>
+        <label>max_tokens
+          <input id="llm-max" type="number" min="16" max="8192" step="1" value="300">
+        </label>
+        <label class="chk"><input id="llm-thinking" type="checkbox"><span>thinking</span></label>
+        <label class="chk"><input id="llm-stream" type="checkbox" checked><span>stream</span></label>
+        <label class="chk" title="После ответа сервис ещё слушает микрофон — продолжать диалог можно без слова-обращения">
+          <input id="llm-follow" type="checkbox">
+          <span>продолжать диалог без обращения</span>
+        </label>
+        <label>Окно, с
+          <input id="llm-follow-sec" type="number" min="3" max="60" step="1" value="10">
+        </label>
+      </div>
 
-    <label class="llm-prompt-label">Системный промпт
-      <textarea id="llm-system" rows="3"></textarea>
-    </label>
+      <label class="llm-prompt-label">Системный промпт
+        <textarea id="llm-system" rows="3"></textarea>
+      </label>
+
+      <div class="row">
+        <button type="submit" class="btn small">Сохранить</button>
+        <button type="button" class="btn small" id="llm-reset">Новый диалог</button>
+        <span id="llm-saved" class="muted small"></span>
+      </div>
+    </form>
 
     <div class="row llm-test">
       <input id="llm-test-text" type="text" placeholder="Проверить текстом, без микрофона…">
