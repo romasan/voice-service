@@ -1217,6 +1217,8 @@
     name.appendChild(document.createTextNode(isMacName ? 'неизвестное устройство' : (d.name || d.mac)));
     if (d.connected) name.appendChild(btChip('подключено', 'conn'));
     else if (d.paired) name.appendChild(btChip('сопряжено', 'pair'));
+    if (d.rssi) name.appendChild(btChip('в эфире ' + d.rssi + ' dBm', 'live'));
+    else if (!d.connected) name.appendChild(btChip('известно ранее'));
     const mac = document.createElement('div');
     mac.className = 'bt-mac';
     mac.textContent = d.mac + (d.trusted ? ' · доверено' : '') + (d.sink ? ' · ' + d.sink.replace('bluez_sink.', '') : '');
@@ -1240,9 +1242,12 @@
 
     if (d.connected) {
       mkBtn('Отключить', () => btAction('/api/bluetooth/disconnect', { mac: d.mac }, 'отключаю…'));
+    } else if (!d.paired) {
+      mkBtn('Сопрячь', () => btAction('/api/bluetooth/pair', { mac: d.mac }, 'сопрягаю…', 'сопряжено: ' + (d.name || d.mac)),
+        'спарить устройство, потом подключать');
+      mkBtn('Подключить', () => btAction('/api/bluetooth/connect', { mac: d.mac }, 'подключаю…'));
     } else {
-      mkBtn(d.paired ? 'Подключить' : 'Подключить', () => btAction('/api/bluetooth/connect', { mac: d.mac }, 'подключаю…'),
-        d.paired ? '' : 'устройство не сопряжено — подключение запустит сопряжение');
+      mkBtn('Подключить', () => btAction('/api/bluetooth/connect', { mac: d.mac }, 'подключаю…'));
     }
     const delBtn = document.createElement('button');
     delBtn.className = 'bt-del';
@@ -1353,12 +1358,12 @@
   $('bt-scan').addEventListener('click', async () => {
     if (btUi.busy) return;
     btUi.busy = true;
-    $('bt-info').textContent = 'сканирую 8 секунд…';
+    $('bt-info').textContent = 'сканирую 12 секунд (classic + LE)…';
     try {
       const r = await fetch('/api/bluetooth/scan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ seconds: 8 }),
+        body: JSON.stringify({ seconds: 12 }),
       });
       const d = await r.json();
       if (d.error) $('bt-info').textContent = d.error;

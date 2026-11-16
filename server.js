@@ -1260,6 +1260,20 @@ function btInfoSync(mac) {
   };
 }
 
+const btSeen = new Map();
+
+function btMarkSeen(mac, rssi) {
+  if (!mac) return;
+  btSeen.set(mac, { rssi: rssi, at: Date.now() });
+}
+
+function btSeenRssi(mac) {
+  const e = btSeen.get(mac);
+  if (!e) return null;
+  if (Date.now() - e.at > 120000) { btSeen.delete(mac); return null; }
+  return e.rssi;
+}
+
 function btSinks() {
   const map = {};
   let out = '';
@@ -1299,8 +1313,18 @@ function btState() {
     }
   } catch (e) { /* ignore */ }
   const sinks = btSinks();
-  for (const d of devices) d.sink = sinks[d.mac.toLowerCase()] || null;
-  devices.sort((a, b) => (Number(b.connected) - Number(a.connected)) || (Number(b.paired) - Number(a.paired)) || a.name.localeCompare(b.name));
+  for (const d of devices) {
+    d.sink = sinks[d.mac.toLowerCase()] || null;
+    if (!d.rssi) {
+      const seen = btSeenRssi(d.mac);
+      if (seen != null) d.rssi = seen;
+    }
+  }
+  devices.sort((a, b) =>
+    (Number(b.connected) - Number(a.connected)) ||
+    (Number(!!b.rssi) - Number(!!a.rssi)) ||
+    (Number(b.paired) - Number(a.paired)) ||
+    a.name.localeCompare(b.name));
   return { controller: controller, devices: devices, sinks: Object.values(sinks) };
 }
 
@@ -1723,10 +1747,28 @@ const server = http.createServer((req, res) => {
       if (method !== 'POST') return sendJson(res, { error: 'POST required' }, 405);
       return readBody(req, (err, body) => {
         if (err) return sendJson(res, { error: 'bad json' }, 400);
-        const seconds = clamp((body && body.seconds) || 8, 3, 20);
-        btRun(['--timeout', String(seconds), 'scan', 'on'], (seconds + 8) * 1000, (err2) => {
+        const seconds = clamp((body && body.seconds) || 12, 5, 20);
+        btRun(['--timeout', String(seconds), 'scan', 'on'], (seconds + 8) * 1000, (err2, r2) => {
           if (err2) return sendJson(res, { error: err2.message }, 500);
-          try { sendJson(res, Object.assign({ ok: true }, btState())); } catch (e) { sendJson(res, { error: e.message }, 500); }
+          const rssiMap = {};
+          for (const line of String((r2 && r2.out) || '').split('\n')) {
+            const m = line.match(/Device\s+([0-9A-F:]{17})\s+RSSI:\s*(-?\d+)/i);
+            if (m) rssiMap[m[1].toUpperCase()] = Number(m[2]);
+            const seen = line.match(/Device\s+([0-9A-F:]{17})/i);
+            if (seen) btMarkSeen(seen[1].toUpperCase(), m ? Number(m[2]) : null);
+          }
+          try {
+            const state = btState();
+            for (const d of state.devices) {
+              if (!d.rssi && rssiMap[d.mac]) d.rssi = rssiMap[d.mac];
+            }
+            state.devices.sort((a, b) =>
+              (Number(b.connected) - Number(a.connected)) ||
+              (Number(!!b.rssi) - Number(!!a.rssi)) ||
+              (Number(b.paired) - Number(a.paired)) ||
+              a.name.localeCompare(b.name));
+            sendJson(res, Object.assign({ ok: true }, state));
+          } catch (e) { sendJson(res, { error: e.message }, 500); }
         });
       });
     }
@@ -1784,6 +1826,31 @@ const server = http.createServer((req, res) => {
         } else {
           doRemove();
         }
+      });
+    }
+    if (p === '/api/bluetooth/pair') {
+      if (method !== 'POST') return sendJson(res, { error: 'POST required' }, 405);
+      return readBody(req, (err, body) => {
+        if (err) return sendJson(res, { error: 'bad json' }, 400);
+        const mac = String((body && body.mac) || '').toUpperCase();
+        if (!/^[0-9A-F:]{17}$/.test(mac)) return sendJson(res, { error: 'неверный MAC' }, 400);
+        btRun(['pair', mac], 40000, (err2, r2) => {
+          if (err2) return sendJson(res, { error: err2.message }, 500);
+          const log = String(r2.out || '');
+          const failed = /Failed to pair|not available|AuthenticationFailed|AuthenticationCanceled/i.test(log);
+          if (!failed) btRun(['trust', mac], 15000, () => {});
+          setTimeout(() => {
+            let state;
+            try { state = btState(); } catch (e) { return sendJson(res, { error: e.message }, 500); }
+            const dev = (state.devices || []).find((d) => d.mac === mac);
+            const ok = !failed && !!(dev && dev.paired);
+            sendJson(res, Object.assign({
+              ok: ok,
+              error: ok ? undefined : (log.match(/Failed to pair[^\n]*|not available/) || ['не удалось сопрячь'])[0],
+              log: log.trim().split('\n').slice(-4),
+            }, state));
+          }, 800);
+        });
       });
     }
     if (p === '/api/bluetooth/trust') {
