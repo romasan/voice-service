@@ -1762,6 +1762,30 @@ const server = http.createServer((req, res) => {
         });
       });
     }
+    if (p === '/api/bluetooth/remove') {
+      if (method !== 'POST') return sendJson(res, { error: 'POST required' }, 405);
+      return readBody(req, (err, body) => {
+        if (err) return sendJson(res, { error: 'bad json' }, 400);
+        const mac = String((body && body.mac) || '').toUpperCase();
+        if (!/^[0-9A-F:]{17}$/.test(mac)) return sendJson(res, { error: 'неверный MAC' }, 400);
+        const info = btInfoSync(mac);
+        const doRemove = () => btRun(['remove', mac], 20000, (err2, r2) => {
+          if (err2) return sendJson(res, { error: err2.message }, 500);
+          const log = String(r2.out || '');
+          if (/Failed to remove|not available/i.test(log)) {
+            return sendJson(res, { ok: false, error: (log.match(/Failed to [^\n]+/) || ['не удалось удалить'])[0] }, 400);
+          }
+          setTimeout(() => {
+            try { sendJson(res, Object.assign({ ok: true, removed: mac }, btState())); } catch (e) { sendJson(res, { error: e.message }, 500); }
+          }, 500);
+        });
+        if (info && info.connected) {
+          btRun(['disconnect', mac], 15000, () => setTimeout(doRemove, 700));
+        } else {
+          doRemove();
+        }
+      });
+    }
     if (p === '/api/bluetooth/trust') {
       if (method !== 'POST') return sendJson(res, { error: 'POST required' }, 405);
       return readBody(req, (err, body) => {

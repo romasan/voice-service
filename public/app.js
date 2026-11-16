@@ -1244,6 +1244,20 @@
       mkBtn(d.paired ? 'Подключить' : 'Подключить', () => btAction('/api/bluetooth/connect', { mac: d.mac }, 'подключаю…'),
         d.paired ? '' : 'устройство не сопряжено — подключение запустит сопряжение');
     }
+    const delBtn = document.createElement('button');
+    delBtn.className = 'bt-del';
+    delBtn.type = 'button';
+    delBtn.title = 'удалить устройство (unpair)';
+    delBtn.setAttribute('aria-label', 'удалить устройство ' + (d.name || d.mac));
+    delBtn.textContent = '×';
+    delBtn.disabled = btUi.busy;
+    delBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      if (!window.confirm('Удалить «' + (d.name || d.mac) + '»? Устройство будет отвязано (unpair).')) return;
+      btAction('/api/bluetooth/remove', { mac: d.mac }, 'удаляю устройство…', 'устройство удалено: ' + (d.name || d.mac));
+    });
+    actions.appendChild(delBtn);
+
     if (d.sink) {
       mkBtn('Сделать выводом', async () => {
         const r = await postAudio('/api/audio/sink', { name: d.sink, setDefault: true, mute: false }, 'вывод переключён на ' + d.name);
@@ -1305,7 +1319,7 @@
     return err;
   }
 
-  async function btAction(path, body, busyText) {
+  async function btAction(path, body, busyText, okText) {
     if (btUi.busy) return;
     btUi.busy = true;
     $('bt-info').textContent = busyText || '…';
@@ -1318,7 +1332,7 @@
       const d = await r.json();
       if (d.error) { $('bt-info').textContent = btErrorText(d.error); }
       else {
-        $('bt-info').textContent = d.warning || (body && body.mac ? 'готово: ' + (body.mac || '') : 'готово');
+        $('bt-info').textContent = d.warning || okText || (body && body.mac ? 'готово: ' + (body.mac || '') : 'готово');
         if (d.devices) btRender(d);
       }
     } catch (e) {
