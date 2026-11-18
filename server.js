@@ -498,11 +498,40 @@ function loadCfg() {
   return out;
 }
 
-function saveCfg() {
+// Конфиг может меняться часто (в т.ч. при озвучке), поэтому пишем на диск
+// не на каждое изменение, а с задержкой и асинхронно — SD-карта целее.
+const CFG_SAVE_DELAY_MS = Number(process.env.CFG_SAVE_DELAY_MS || 800);
+let cfgSaveTimer = null;
+let cfgSavePending = false;
+
+function writeCfgSync() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     fs.writeFileSync(CFG_PATH, JSON.stringify(cfg, null, 2));
   } catch (e) { /* ignore */ }
+}
+
+function flushCfg() {
+  if (cfgSaveTimer) { clearTimeout(cfgSaveTimer); cfgSaveTimer = null; }
+  if (!cfgSavePending) return;
+  cfgSavePending = false;
+  const data = JSON.stringify(cfg, null, 2);
+  fs.mkdir(DATA_DIR, { recursive: true }, (err) => {
+    if (err) return;
+    fs.writeFile(CFG_PATH, data, () => { /* ignore */ });
+  });
+}
+
+function flushCfgSync() {
+  if (!cfgSavePending) return;
+  cfgSavePending = false;
+  writeCfgSync();
+}
+
+function saveCfg() {
+  cfgSavePending = true;
+  if (cfgSaveTimer) return;
+  cfgSaveTimer = setTimeout(() => { cfgSaveTimer = null; flushCfg(); }, CFG_SAVE_DELAY_MS);
 }
 
 let cfg = loadCfg();
@@ -1092,6 +1121,16 @@ function synthesize(text, opts, cb, playToken) {
   else runEspeak(text, opts, file, finish);
 }
 
+// Пишем конфиг только если параметры реально изменились: озвучка каждого
+// предложения вызывает buildTtsOptions с теми же значениями.
+function persistTts(engine, values) {
+  const prev = cfg.tts[engine];
+  if (cfg.tts.engine === engine && prev && JSON.stringify(prev) === JSON.stringify(values)) return;
+  cfg.tts[engine] = values;
+  cfg.tts.engine = engine;
+  saveCfg();
+}
+
 function buildTtsOptions(body) {
   const engine = body.engine === 'rhvoice' ? 'rhvoice'
     : body.engine === 'espeak' ? 'espeak'
@@ -1111,10 +1150,8 @@ function buildTtsOptions(body) {
       volume: clamp(body.volume != null ? body.volume : d.volume, 0, 100),
       play: body.play !== false,
     };
-    cfg.tts.rhvoice = { voice: opts.voice, rate: opts.rate, pitch: opts.pitch, volume: opts.volume };
     opts.params = { rate: opts.rate, pitch: opts.pitch, volume: opts.volume };
-    cfg.tts.engine = engine;
-    saveCfg();
+    persistTts('rhvoice', { voice: opts.voice, rate: opts.rate, pitch: opts.pitch, volume: opts.volume });
     return { engine: engine, opts: opts };
   }
   if (engine === 'piper') {
@@ -1131,10 +1168,8 @@ function buildTtsOptions(body) {
       sentenceSilence: clamp(body.sentenceSilence != null ? body.sentenceSilence : d.sentenceSilence, 0, 1),
       play: body.play !== false,
     };
-    cfg.tts.piper = { voice: opts.voice, lengthScale: opts.lengthScale, noiseScale: opts.noiseScale, sentenceSilence: opts.sentenceSilence };
     opts.params = { lengthScale: opts.lengthScale, noiseScale: opts.noiseScale, sentenceSilence: opts.sentenceSilence };
-    cfg.tts.engine = 'piper';
-    saveCfg();
+    persistTts('piper', { voice: opts.voice, lengthScale: opts.lengthScale, noiseScale: opts.noiseScale, sentenceSilence: opts.sentenceSilence });
     return { engine: 'piper', opts: opts };
   }
   const d = cfg.tts.espeak || {};
@@ -1146,10 +1181,8 @@ function buildTtsOptions(body) {
     amplitude: clamp(body.amplitude != null ? body.amplitude : d.amplitude, 0, 200),
     play: body.play !== false,
   };
-  cfg.tts.espeak = { voice: opts.voice, speed: opts.speed, pitch: opts.pitch, amplitude: opts.amplitude };
   opts.params = { speed: opts.speed, pitch: opts.pitch, amplitude: opts.amplitude };
-  cfg.tts.engine = 'espeak';
-  saveCfg();
+  persistTts('espeak', { voice: opts.voice, speed: opts.speed, pitch: opts.pitch, amplitude: opts.amplitude });
   return { engine: 'espeak', opts: opts };
 }
 
@@ -2232,6 +2265,7 @@ server.listen(PORT, HOST, () => {
 });
 
 function shutdown() {
+  flushCfgSync();
   finishRecording('shutdown');
   stopCapture();
   server.close(() => process.exit(0));
@@ -2239,3 +2273,4 @@ function shutdown() {
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+process.on('exit', () => flushCfgSync());
