@@ -1774,7 +1774,7 @@ const server = http.createServer((req, res) => {
     }
     if (p === '/api/bluetooth/connect' || p === '/api/bluetooth/disconnect') {
       if (method !== 'POST') return sendJson(res, { error: 'POST required' }, 405);
-      const action = p.endsWith('connect') ? 'connect' : 'disconnect';
+      const action = p.endsWith('/disconnect') ? 'disconnect' : 'connect';
       return readBody(req, (err, body) => {
         if (err) return sendJson(res, { error: 'bad json' }, 400);
         const mac = String((body && body.mac) || '').toUpperCase();
@@ -1792,10 +1792,10 @@ const server = http.createServer((req, res) => {
               warning = 'устройство подключено, но sink A2DP не появился — профиль мог занять greeter (см. AGENTS.md)';
             }
             const ok = !failed && (action === 'disconnect' ? !(dev && dev.connected) : !!(dev && dev.connected));
-            const errorLine = failed ? (rawLog.match(/Failed to [^\n]+/) || ['не удалось подключиться'])[0] : null;
+            const errorLine = failed ? (rawLog.match(/Failed to [^\n]+/) || [action === 'disconnect' ? 'не удалось отключиться' : 'не удалось подключиться'])[0] : null;
             sendJson(res, Object.assign({
               ok: ok,
-              error: ok ? undefined : (errorLine || 'устройство не подключилось'),
+              error: ok ? undefined : (errorLine || (action === 'disconnect' ? 'устройство не отключилось' : 'устройство не подключилось')),
               action: action,
               warning: warning,
               log: rawLog.trim().split('\n').slice(-4),
