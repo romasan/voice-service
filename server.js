@@ -1502,9 +1502,11 @@ const https = require('https');
 
 const LLM_BASE = process.env.LLM_BASE_URL || 'https://api.deepseek.com';
 const LLM_URL = new URL(LLM_BASE);
+const LLM_TLS = LLM_URL.protocol !== 'http:';
 const LLM_HOST = LLM_URL.hostname;
-const LLM_PORT = LLM_URL.port ? Number(LLM_URL.port) : 443;
+const LLM_PORT = LLM_URL.port ? Number(LLM_URL.port) : (LLM_TLS ? 443 : 80);
 const LLM_PREFIX = LLM_URL.pathname.replace(/\/+$/, '');
+const LLM_TRANSPORT = LLM_TLS ? https : http; // локальные/прокси-эндпоинты бывают по http://
 
 const llm = {
   models: null, modelsAt: 0,
@@ -1526,7 +1528,7 @@ function llmRequest(method, pathName, bodyObj, onResponse, onError) {
   const key = llmKey();
   if (!key) return onError(new Error('нет API-ключа: добавьте LLM_API_KEY в ' + path.join(__dirname, '.env')));
   const payload = bodyObj ? JSON.stringify(bodyObj) : null;
-  const req = https.request({
+  const req = LLM_TRANSPORT.request({
     host: LLM_HOST,
     port: LLM_PORT,
     path: LLM_PREFIX + pathName,
