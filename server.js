@@ -135,6 +135,22 @@ function stopIdleTimer() {
   }
 }
 
+function captureWanted() {
+  return capture.clients.size > 0 || asr.enabled || !!capture.rec;
+}
+
+// force: захват нужен был до смерти parec (например, шла запись), даже если rec уже закрыт
+function scheduleCaptureRestart(delayMs, alsoForLostRecording) {
+  if (!captureWanted() && !alsoForLostRecording) return;
+  setTimeout(() => {
+    if (capture.proc) return;
+    if (!captureWanted() && !alsoForLostRecording) return;
+    startCapture();
+    // если после рестарта никто не слушает, не держим parec вечно
+    if (!capture.clients.size && !asr.enabled && !capture.rec) scheduleIdleStop();
+  }, delayMs);
+}
+
 function scheduleIdleStop() {
   stopIdleTimer();
   if (capture.clients.size > 0 || capture.rec || asr.enabled) return;
@@ -165,12 +181,9 @@ function startCapture(source) {
     capture.buf = Buffer.alloc(0);
     capture.lastError = 'parec: ' + e.message;
     broadcast('status', { capturing: false, error: capture.lastError });
+    const wasRecording = !!capture.rec;
     if (capture.rec) finishRecording('capture error');
-    if (capture.clients.size > 0) {
-      setTimeout(() => {
-        if (capture.clients.size > 0 && !capture.proc) startCapture();
-      }, 1000);
-    }
+    scheduleCaptureRestart(capture.clients.size > 0 || wasRecording ? 1000 : 3000, wasRecording);
   });
 
   proc.stdout.on('data', (chunk) => {
@@ -200,12 +213,9 @@ function startCapture(source) {
     capture.buf = Buffer.alloc(0);
     capture.lastError = errBuf.trim() || ('parec exited: ' + (code != null ? code : sig));
     broadcast('status', { capturing: false, error: capture.lastError });
+    const wasRecording = !!capture.rec;
     if (capture.rec) finishRecording('capture interrupted');
-    if (capture.clients.size > 0) {
-      setTimeout(() => {
-        if (capture.clients.size > 0 && !capture.proc) startCapture();
-      }, 1000);
-    }
+    scheduleCaptureRestart(capture.clients.size > 0 || wasRecording ? 1000 : 3000, wasRecording);
   });
 }
 
