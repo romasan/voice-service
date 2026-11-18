@@ -8,7 +8,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { spawn, execFile } = require('child_process');
+const { spawn, execFile, execFileSync } = require('child_process'); // execFileSync — только один разовый кэшируемый probe piper --help
 
 function loadEnvFile() {
   const file = path.join(__dirname, '.env');
@@ -1171,11 +1171,21 @@ function readBody(req, cb, limit) {
 }
 
 /* ---------- системный звук (PulseAudio + ALSA) ---------- */
-const { execFileSync } = require('child_process');
+// Внешние команды — только асинхронно: execFileSync блокировал event loop,
+// из-за чего вставали кадры микрофона, SSE и запись WAV.
+
+function execP(cmd, args, opts) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, opts, (err, stdout, stderr) => {
+      if (err) return reject(err);
+      resolve({ stdout: String(stdout || ''), stderr: String(stderr || '') });
+    });
+  });
+}
 
 function pactlJson(args) {
-  const out = execFileSync('pactl', ['--format=json'].concat(args), { timeout: 8000, maxBuffer: 1 << 22 });
-  return JSON.parse(out.toString());
+  return execP('pactl', ['--format=json'].concat(args), { timeout: 8000, maxBuffer: 1 << 22 })
+    .then((r) => JSON.parse(r.stdout));
 }
 
 function pulseVolume(vol) {
@@ -1198,45 +1208,55 @@ function prettyDevice(name) {
   return name;
 }
 
-function amixerControls(card) {
-  const controls = [];
+async function amixerControls(card) {
   let out;
   try {
-    out = execFileSync('amixer', ['-c', String(card), 'scontrols'], { timeout: 5000 }).toString();
+    out = (await execP('amixer', ['-c', String(card), 'scontrols'], { timeout: 5000 })).stdout;
   } catch (e) {
-    return controls;
+    return [];
   }
-  const names = Array.from(out.matchAll(/'([^']+)'/g), (m) => m[1]);
-  for (const nm of names) {
-    if (!/mic|gain|capture|boost/i.test(nm)) continue;
+  const names = Array.from(out.matchAll(/'([^']+)'/g), (m) => m[1])
+    .filter((nm) => /mic|gain|capture|boost/i.test(nm));
+  const found = await Promise.all(names.map(async (nm) => {
     let txt;
     try {
-      txt = execFileSync('amixer', ['-c', String(card), 'sget', nm], { timeout: 5000 }).toString();
-    } catch (e) { continue; }
+      txt = (await execP('amixer', ['-c', String(card), 'sget', nm], { timeout: 5000 })).stdout;
+    } catch (e) { return null; }
     const lim = txt.match(/Limits:\s+\S+\s+(-?\d+)\s+-\s+(-?\d+)/);
     if (lim) {
       const val = txt.match(/(?:Mono|Front Left|Capture):\s*(?:\S+\s+)?(-?\d+)\s*\[/);
-      if (val) {
-        controls.push({ id: nm, kind: 'int', min: Number(lim[1]), max: Number(lim[2]), value: Number(val[1]) });
-        continue;
-      }
+      if (val) return { id: nm, kind: 'int', min: Number(lim[1]), max: Number(lim[2]), value: Number(val[1]) };
     }
-    if (/\[(on|off)\]/i.test(txt)) {
-      controls.push({ id: nm, kind: 'bool', value: /\[on\]/i.test(txt) });
-    }
-  }
-  return controls;
+    if (/\[(on|off)\]/i.test(txt)) return { id: nm, kind: 'bool', value: /\[on\]/i.test(txt) };
+    return null;
+  }));
+  return found.filter(Boolean);
 }
 
-function audioState(sourceName) {
-  const sinks = pactlJson(['list', 'sinks']).map((s) => ({
+const AUDIO_CACHE_MS = Number(process.env.AUDIO_CACHE_MS || 2000);
+let audioCache = { key: '', at: 0, data: null, promise: null };
+let audioGen = 0;
+
+function audioInvalidate() {
+  audioGen++;
+  audioCache = { key: '', at: 0, data: null, promise: null };
+}
+
+async function audioStateAsync(sourceName) {
+  const [sinksRaw, sourcesRaw, defaultSink, defaultSource] = await Promise.all([
+    pactlJson(['list', 'sinks']),
+    pactlJson(['list', 'sources']),
+    execP('pactl', ['get-default-sink'], { timeout: 5000 }).then((r) => r.stdout.trim()),
+    execP('pactl', ['get-default-source'], { timeout: 5000 }).then((r) => r.stdout.trim()),
+  ]);
+  const sinks = sinksRaw.map((s) => ({
     name: s.name,
     label: prettyDevice(s.name),
     volume: pulseVolume(s.volume),
     mute: !!s.mute,
     monitor: false,
   }));
-  const sources = pactlJson(['list', 'sources'])
+  const sources = sourcesRaw
     .filter((s) => !s.name.endsWith('.monitor'))
     .map((s) => ({
       name: s.name,
@@ -1245,37 +1265,60 @@ function audioState(sourceName) {
       mute: !!s.mute,
       card: s.properties && s.properties['alsa.card'] ? Number(s.properties['alsa.card']) : null,
     }));
-  const defaultSink = execFileSync('pactl', ['get-default-sink'], { timeout: 5000 }).toString().trim();
-  const defaultSource = execFileSync('pactl', ['get-default-source'], { timeout: 5000 }).toString().trim();
   const target = sourceName || defaultSource;
   const src = sources.find((s) => s.name === target) || sources[0];
-  const card = src && src.card != null ? { index: src.card, controls: amixerControls(src.card) } : null;
+  const card = src && src.card != null ? { index: src.card, controls: await amixerControls(src.card) } : null;
   return { sinks, sources, defaultSink, defaultSource, card };
 }
 
-function audioSet(kind, body) {
+// Кэш на пару секунд: вкладка опрашивает состояние часто, а параллельные
+// запросы не должны запускать одни и те же pactl/amixer заново.
+function audioState(sourceName, force) {
+  const key = String(sourceName || '');
+  const now = Date.now();
+  if (!force && audioCache.data && audioCache.key === key && now - audioCache.at < AUDIO_CACHE_MS) {
+    return Promise.resolve(audioCache.data);
+  }
+  if (!force && audioCache.promise && audioCache.key === key) return audioCache.promise;
+  const gen = audioGen;
+  const p = audioStateAsync(sourceName).then((data) => {
+    if (gen === audioGen) audioCache = { key: key, at: Date.now(), data: data, promise: null };
+    return data;
+  }).catch((e) => {
+    if (gen === audioGen && audioCache.promise === p) audioCache = { key: '', at: 0, data: null, promise: null };
+    throw e;
+  });
+  audioCache = { key: key, at: 0, data: null, promise: p };
+  return p;
+}
+
+async function audioSet(kind, body) {
   const isSink = kind === 'sink';
   const name = String(body.name || '');
   if (!name) return { error: 'не указано устройство' };
+  const jobs = [];
   if (body.volume != null) {
     const v = clamp(body.volume, 0, 150);
-    execFileSync('pactl', [isSink ? 'set-sink-volume' : 'set-source-volume', name, v + '%'], { timeout: 5000 });
+    jobs.push(execP('pactl', [isSink ? 'set-sink-volume' : 'set-source-volume', name, v + '%'], { timeout: 5000 }));
   }
   if (body.mute != null) {
-    execFileSync('pactl', [isSink ? 'set-sink-mute' : 'set-source-mute', name, body.mute ? '1' : '0'], { timeout: 5000 });
+    jobs.push(execP('pactl', [isSink ? 'set-sink-mute' : 'set-source-mute', name, body.mute ? '1' : '0'], { timeout: 5000 }));
   }
   if (body.setDefault) {
-    execFileSync('pactl', [isSink ? 'set-default-sink' : 'set-default-source', name], { timeout: 5000 });
+    jobs.push(execP('pactl', [isSink ? 'set-default-sink' : 'set-default-source', name], { timeout: 5000 }));
   }
+  await Promise.all(jobs);
+  audioInvalidate();
   return { ok: true };
 }
 
-function cardSet(card, control, value) {
+async function cardSet(card, control, value) {
   const idx = String(Number(card));
   if (idx === 'NaN' || !control) return { error: 'неверная карта или контрол' };
   const val = typeof value === 'boolean' ? (value ? 'on' : 'off') : String(Number(value));
   if (val === 'NaN') return { error: 'неверное значение' };
-  execFileSync('amixer', ['-c', idx, 'sset', String(control), val], { timeout: 5000 });
+  await execP('amixer', ['-c', idx, 'sset', String(control), val], { timeout: 5000 });
+  audioInvalidate();
   return { ok: true };
 }
 
@@ -1298,8 +1341,9 @@ function btRun(args, timeoutMs, cb) {
   proc.stdout.on('data', collect);
   proc.stderr.on('data', collect);
   const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch (e) { /* ignore */ } }, timeoutMs || 30000);
-  proc.on('error', (e) => { clearTimeout(timer); cb(e); });
-  proc.on('exit', (code) => { clearTimeout(timer); cb(null, { code: code, out: out }); });
+  const done = (fn, a, b) => { clearTimeout(timer); btInvalidate(); audioInvalidate(); fn(a, b); };
+  proc.on('error', (e) => done(cb, e));
+  proc.on('exit', (code) => done(cb, null, { code: code, out: out }));
 }
 
 function btField(txt, key) {
@@ -1307,9 +1351,9 @@ function btField(txt, key) {
   return m ? m[1].trim() : '';
 }
 
-function btInfoSync(mac) {
+async function btInfo(mac) {
   let txt = '';
-  try { txt = execFileSync('bluetoothctl', ['info', mac], { timeout: 8000 }).toString(); } catch (e) { return null; }
+  try { txt = (await execP('bluetoothctl', ['info', mac], { timeout: 8000 })).stdout; } catch (e) { return null; }
   if (!/Device\s+[0-9A-F:]{17}/i.test(txt)) return null;
   const rssiRaw = btField(txt, 'RSSI');
   const rssi = rssiRaw ? parseInt(rssiRaw, 16) : null;
@@ -1338,10 +1382,10 @@ function btSeenRssi(mac) {
   return e.rssi;
 }
 
-function btSinks() {
+async function btSinks() {
   const map = {};
   let out = '';
-  try { out = execFileSync('pactl', ['list', 'short', 'sinks'], { timeout: 5000 }).toString(); } catch (e) { return map; }
+  try { out = (await execP('pactl', ['list', 'short', 'sinks'], { timeout: 5000 })).stdout; } catch (e) { return map; }
   for (const line of out.split('\n')) {
     const parts = line.split('\t');
     const name = parts[1] || '';
@@ -1351,10 +1395,16 @@ function btSinks() {
   return map;
 }
 
-function btState() {
+async function btStateAsync() {
+  // show/devices/сокеты — параллельно; info по каждому устройству — тоже.
+  const [showRes, devRes, sinks] = await Promise.all([
+    execP('bluetoothctl', ['show'], { timeout: 8000 }).catch(() => null),
+    execP('bluetoothctl', ['devices'], { timeout: 8000 }).catch(() => null),
+    btSinks(),
+  ]);
   let controller = null;
-  try {
-    const show = execFileSync('bluetoothctl', ['show'], { timeout: 8000 }).toString();
+  if (showRes) {
+    const show = showRes.stdout;
     controller = {
       address: (show.match(/Controller\s+([0-9A-F:]{17})/i) || [])[1] || '',
       name: btField(show, 'Name'),
@@ -1363,20 +1413,17 @@ function btState() {
       discoverable: btField(show, 'Discoverable') === 'yes',
       discovering: btField(show, 'Discovering') === 'yes',
     };
-  } catch (e) {
-    controller = null;
   }
-  let devices = [];
-  try {
-    const txt = execFileSync('bluetoothctl', ['devices'], { timeout: 8000 }).toString();
-    for (const line of txt.split('\n')) {
+  const listed = [];
+  if (devRes) {
+    for (const line of devRes.stdout.split('\n')) {
       const m = line.match(/^Device\s+([0-9A-F:]{17})\s+(.*)$/i);
       if (!m) continue;
-      const info = btInfoSync(m[1].toUpperCase());
-      devices.push(info || { mac: m[1].toUpperCase(), name: m[2], connected: false, paired: false, trusted: false });
+      listed.push({ mac: m[1].toUpperCase(), name: m[2] });
     }
-  } catch (e) { /* ignore */ }
-  const sinks = btSinks();
+  }
+  const infos = await Promise.all(listed.map((d) => btInfo(d.mac)));
+  const devices = listed.map((d, i) => infos[i] || { mac: d.mac, name: d.name, connected: false, paired: false, trusted: false });
   for (const d of devices) {
     d.sink = sinks[d.mac.toLowerCase()] || null;
     if (!d.rssi) {
@@ -1390,6 +1437,31 @@ function btState() {
     (Number(b.paired) - Number(a.paired)) ||
     a.name.localeCompare(b.name));
   return { controller: controller, devices: devices, sinks: Object.values(sinks) };
+}
+
+const BT_CACHE_MS = Number(process.env.BT_CACHE_MS || 2500);
+let btCache = { at: 0, data: null, promise: null };
+let btGen = 0;
+
+function btInvalidate() {
+  btGen++;
+  btCache = { at: 0, data: null, promise: null };
+}
+
+function btState(force) {
+  const now = Date.now();
+  if (!force && btCache.data && now - btCache.at < BT_CACHE_MS) return Promise.resolve(btCache.data);
+  if (!force && btCache.promise) return btCache.promise;
+  const gen = btGen;
+  const p = btStateAsync().then((data) => {
+    if (gen === btGen) btCache = { at: Date.now(), data: data, promise: null };
+    return data;
+  }).catch((e) => {
+    if (gen === btGen && btCache.promise === p) btCache = { at: 0, data: null, promise: null };
+    throw e;
+  });
+  btCache = { at: 0, data: null, promise: p };
+  return p;
 }
 
 /* ---------- LLM (DeepSeek, OpenAI-compatible) ---------- */
@@ -1806,11 +1878,8 @@ function handleRequest(req, res) {
       });
     }
     if (p === '/api/bluetooth') {
-      try {
-        return sendJson(res, btState());
-      } catch (e) {
-        return sendJson(res, { error: e.message }, 500);
-      }
+      return btState().then((state) => sendJson(res, state))
+        .catch((e) => { try { sendJson(res, { error: e.message }, 500); } catch (e2) { /* ignore */ } });
     }
     if (p === '/api/bluetooth/scan') {
       if (method !== 'POST') return sendJson(res, { error: 'POST required' }, 405);
@@ -1826,8 +1895,8 @@ function handleRequest(req, res) {
             const seen = line.match(/Device\s+([0-9A-F:]{17})/i);
             if (seen) btMarkSeen(seen[1].toUpperCase(), m ? Number(m[2]) : null);
           }
-          try {
-            const state = btState();
+          btInvalidate();
+          btState(true).then((state) => {
             for (const d of state.devices) {
               if (!d.rssi && rssiMap[d.mac]) d.rssi = rssiMap[d.mac];
             }
@@ -1837,7 +1906,7 @@ function handleRequest(req, res) {
               (Number(b.paired) - Number(a.paired)) ||
               a.name.localeCompare(b.name));
             sendJson(res, Object.assign({ ok: true }, state));
-          } catch (e) { sendJson(res, { error: e.message }, 500); }
+          }).catch((e) => { try { sendJson(res, { error: e.message }, 500); } catch (e2) { /* ignore */ } });
         });
       });
     }
@@ -1853,22 +1922,22 @@ function handleRequest(req, res) {
           const rawLog = String(r2.out || '');
           const failed = /Failed to (connect|disconnect)/i.test(rawLog) || /not available/i.test(rawLog);
           setTimeout(() => {
-            let state;
-            try { state = btState(); } catch (e) { return sendJson(res, { error: e.message }, 500); }
-            const dev = (state.devices || []).find((d) => d.mac === mac);
-            let warning = null;
-            if (action === 'connect' && dev && dev.connected && !dev.sink) {
-              warning = 'устройство подключено, но sink A2DP не появился — профиль мог занять greeter (см. AGENTS.md)';
-            }
-            const ok = !failed && (action === 'disconnect' ? !(dev && dev.connected) : !!(dev && dev.connected));
-            const errorLine = failed ? (rawLog.match(/Failed to [^\n]+/) || [action === 'disconnect' ? 'не удалось отключиться' : 'не удалось подключиться'])[0] : null;
-            sendJson(res, Object.assign({
-              ok: ok,
-              error: ok ? undefined : (errorLine || (action === 'disconnect' ? 'устройство не отключилось' : 'устройство не подключилось')),
-              action: action,
-              warning: warning,
-              log: rawLog.trim().split('\n').slice(-4),
-            }, state));
+            btState(true).then((state) => {
+              const dev = (state.devices || []).find((d) => d.mac === mac);
+              let warning = null;
+              if (action === 'connect' && dev && dev.connected && !dev.sink) {
+                warning = 'устройство подключено, но sink A2DP не появился — профиль мог занять greeter (см. AGENTS.md)';
+              }
+              const ok = !failed && (action === 'disconnect' ? !(dev && dev.connected) : !!(dev && dev.connected));
+              const errorLine = failed ? (rawLog.match(/Failed to [^\n]+/) || [action === 'disconnect' ? 'не удалось отключиться' : 'не удалось подключиться'])[0] : null;
+              sendJson(res, Object.assign({
+                ok: ok,
+                error: ok ? undefined : (errorLine || (action === 'disconnect' ? 'устройство не отключилось' : 'устройство не подключилось')),
+                action: action,
+                warning: warning,
+                log: rawLog.trim().split('\n').slice(-4),
+              }, state));
+            }).catch((e) => { try { sendJson(res, { error: e.message }, 500); } catch (e2) { /* ignore */ } });
           }, 1500);
         });
       });
@@ -1879,22 +1948,24 @@ function handleRequest(req, res) {
         if (err) return sendJson(res, { error: 'bad json' }, 400);
         const mac = String((body && body.mac) || '').toUpperCase();
         if (!/^[0-9A-F:]{17}$/.test(mac)) return sendJson(res, { error: 'неверный MAC' }, 400);
-        const info = btInfoSync(mac);
-        const doRemove = () => btRun(['remove', mac], 20000, (err2, r2) => {
-          if (err2) return sendJson(res, { error: err2.message }, 500);
-          const log = String(r2.out || '');
-          if (/Failed to remove|not available/i.test(log)) {
-            return sendJson(res, { ok: false, error: (log.match(/Failed to [^\n]+/) || ['не удалось удалить'])[0] }, 400);
+        btInfo(mac).then((info) => {
+          const doRemove = () => btRun(['remove', mac], 20000, (err2, r2) => {
+            if (err2) return sendJson(res, { error: err2.message }, 500);
+            const log = String(r2.out || '');
+            if (/Failed to remove|not available/i.test(log)) {
+              return sendJson(res, { ok: false, error: (log.match(/Failed to [^\n]+/) || ['не удалось удалить'])[0] }, 400);
+            }
+            setTimeout(() => {
+              btState(true).then((state) => sendJson(res, Object.assign({ ok: true, removed: mac }, state)))
+                .catch((e) => { try { sendJson(res, { error: e.message }, 500); } catch (e2) { /* ignore */ } });
+            }, 500);
+          });
+          if (info && info.connected) {
+            btRun(['disconnect', mac], 15000, () => setTimeout(doRemove, 700));
+          } else {
+            doRemove();
           }
-          setTimeout(() => {
-            try { sendJson(res, Object.assign({ ok: true, removed: mac }, btState())); } catch (e) { sendJson(res, { error: e.message }, 500); }
-          }, 500);
-        });
-        if (info && info.connected) {
-          btRun(['disconnect', mac], 15000, () => setTimeout(doRemove, 700));
-        } else {
-          doRemove();
-        }
+        }).catch((e) => { try { sendJson(res, { error: e.message }, 500); } catch (e2) { /* ignore */ } });
       });
     }
     if (p === '/api/bluetooth/pair') {
@@ -1909,15 +1980,15 @@ function handleRequest(req, res) {
           const failed = /Failed to pair|not available|AuthenticationFailed|AuthenticationCanceled/i.test(log);
           if (!failed) btRun(['trust', mac], 15000, () => {});
           setTimeout(() => {
-            let state;
-            try { state = btState(); } catch (e) { return sendJson(res, { error: e.message }, 500); }
-            const dev = (state.devices || []).find((d) => d.mac === mac);
-            const ok = !failed && !!(dev && dev.paired);
-            sendJson(res, Object.assign({
-              ok: ok,
-              error: ok ? undefined : (log.match(/Failed to pair[^\n]*|not available/) || ['не удалось сопрячь'])[0],
-              log: log.trim().split('\n').slice(-4),
-            }, state));
+            btState(true).then((state) => {
+              const dev = (state.devices || []).find((d) => d.mac === mac);
+              const ok = !failed && !!(dev && dev.paired);
+              sendJson(res, Object.assign({
+                ok: ok,
+                error: ok ? undefined : (log.match(/Failed to pair[^\n]*|not available/) || ['не удалось сопрячь'])[0],
+                log: log.trim().split('\n').slice(-4),
+              }, state));
+            }).catch((e) => { try { sendJson(res, { error: e.message }, 500); } catch (e2) { /* ignore */ } });
           }, 800);
         });
       });
@@ -1931,7 +2002,8 @@ function handleRequest(req, res) {
         const cmd = body && body.value === false ? 'untrust' : 'trust';
         btRun([cmd, mac], 15000, (err2) => {
           if (err2) return sendJson(res, { error: err2.message }, 500);
-          try { sendJson(res, Object.assign({ ok: true }, btState())); } catch (e) { sendJson(res, { error: e.message }, 500); }
+          btState(true).then((state) => sendJson(res, Object.assign({ ok: true }, state)))
+            .catch((e) => { try { sendJson(res, { error: e.message }, 500); } catch (e2) { /* ignore */ } });
         });
       });
     }
@@ -1942,7 +2014,8 @@ function handleRequest(req, res) {
         const on = !(body && body.on === false);
         btRun(['power', on ? 'on' : 'off'], 15000, (err2) => {
           if (err2) return sendJson(res, { error: err2.message }, 500);
-          try { sendJson(res, Object.assign({ ok: true }, btState())); } catch (e) { sendJson(res, { error: e.message }, 500); }
+          btState(true).then((state) => sendJson(res, Object.assign({ ok: true }, state)))
+            .catch((e) => { try { sendJson(res, { error: e.message }, 500); } catch (e2) { /* ignore */ } });
         });
       });
     }
@@ -2017,34 +2090,27 @@ function handleRequest(req, res) {
       return sendJson(res, { ok: true });
     }
     if (p === '/api/audio') {
-      try {
-        return sendJson(res, audioState(u.searchParams.get('source')));
-      } catch (e) {
-        return sendJson(res, { error: 'pactl: ' + e.message }, 500);
-      }
+      return audioState(u.searchParams.get('source')).then((state) => sendJson(res, state))
+        .catch((e) => { try { sendJson(res, { error: 'pactl: ' + e.message }, 500); } catch (e2) { /* ignore */ } });
     }
     if (p === '/api/audio/sink' || p === '/api/audio/source') {
       return readBody(req, (err, body) => {
         if (err) return sendJson(res, { error: 'bad json' }, 400);
-        try {
-          const r = audioSet(p.endsWith('sink') ? 'sink' : 'source', body);
+        (async () => {
+          const r = await audioSet(p.endsWith('sink') ? 'sink' : 'source', body);
           if (r.error) return sendJson(res, r, 400);
-          sendJson(res, { ok: true, state: audioState(body.source || null) });
-        } catch (e) {
-          sendJson(res, { error: e.message }, 500);
-        }
+          sendJson(res, { ok: true, state: await audioState(body.source || null, true) });
+        })().catch((e) => { try { sendJson(res, { error: e.message }, 500); } catch (e2) { /* ignore */ } });
       });
     }
     if (p === '/api/audio/card') {
       return readBody(req, (err, body) => {
         if (err) return sendJson(res, { error: 'bad json' }, 400);
-        try {
-          const r = cardSet(body.card, body.control, body.value);
+        (async () => {
+          const r = await cardSet(body.card, body.control, body.value);
           if (r.error) return sendJson(res, r, 400);
-          sendJson(res, { ok: true, state: audioState(body.source || null) });
-        } catch (e) {
-          sendJson(res, { error: e.message }, 500);
-        }
+          sendJson(res, { ok: true, state: await audioState(body.source || null, true) });
+        })().catch((e) => { try { sendJson(res, { error: e.message }, 500); } catch (e2) { /* ignore */ } });
       });
     }
     if (p === '/api/audio/test') {
