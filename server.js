@@ -1028,7 +1028,7 @@ function runEspeak(text, opts, file, cb) {
     '-p', String(opts.pitch),
     '-a', String(opts.amplitude),
     '-w', file,
-    text,
+    '--', text, // иначе текст, начинающийся с «-», разбирается как опции eSpeak
   ]);
   execFile(es.bin, args, { env: Object.assign({}, process.env, es.env), timeout: 30000, maxBuffer: 1 << 20 }, (err) => {
     if (err) return cb(err);
