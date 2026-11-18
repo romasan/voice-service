@@ -156,17 +156,37 @@ function startCapture(source) {
   capture.buf = Buffer.alloc(0);
   capture.startedAt = Date.now();
   capture.lastError = null;
+  let spawnFailed = false;
+
+  proc.on('error', (e) => {
+    spawnFailed = true;
+    console.error('[voice-service] parec spawn error:', e.message);
+    if (capture.proc === proc) capture.proc = null;
+    capture.buf = Buffer.alloc(0);
+    capture.lastError = 'parec: ' + e.message;
+    broadcast('status', { capturing: false, error: capture.lastError });
+    if (capture.rec) finishRecording('capture error');
+    if (capture.clients.size > 0) {
+      setTimeout(() => {
+        if (capture.clients.size > 0 && !capture.proc) startCapture();
+      }, 1000);
+    }
+  });
 
   proc.stdout.on('data', (chunk) => {
-    capture.buf = capture.buf.length ? Buffer.concat([capture.buf, chunk]) : chunk;
-    let off = 0;
-    while (capture.buf.length - off >= CHUNK_BYTES) {
-      const frameBuf = capture.buf.subarray(off, off + CHUNK_BYTES);
-      off += CHUNK_BYTES;
-      handleFrame(frameBuf);
+    try {
+      capture.buf = capture.buf.length ? Buffer.concat([capture.buf, chunk]) : chunk;
+      let off = 0;
+      while (capture.buf.length - off >= CHUNK_BYTES) {
+        const frameBuf = capture.buf.subarray(off, off + CHUNK_BYTES);
+        off += CHUNK_BYTES;
+        handleFrame(frameBuf);
+      }
+      capture.buf = capture.buf.subarray(off);
+      if (capture.buf.length > CHUNK_BYTES * 64) capture.buf = Buffer.alloc(0);
+    } catch (e) {
+      console.error('[voice-service] capture frame error:', e && (e.stack || e.message || e));
     }
-    capture.buf = capture.buf.subarray(off);
-    if (capture.buf.length > CHUNK_BYTES * 64) capture.buf = Buffer.alloc(0);
   });
 
   let errBuf = '';
@@ -175,6 +195,7 @@ function startCapture(source) {
   });
 
   proc.on('exit', (code, sig) => {
+    if (spawnFailed) return;
     if (capture.proc === proc) capture.proc = null;
     capture.buf = Buffer.alloc(0);
     capture.lastError = errBuf.trim() || ('parec exited: ' + (code != null ? code : sig));
@@ -231,8 +252,9 @@ function handleFrame(buf) {
   }
 
   if (asr.proc && asr.ready && asr.enabled) {
+    const stdin = asr.proc.stdin;
     try {
-      if (asr.proc.stdin.writableLength < 160000) asr.proc.stdin.write(buf);
+      if (stdin && stdin.writable && stdin.writableLength < 160000) stdin.write(buf);
     } catch (e) { /* ignore */ }
   }
 
@@ -330,8 +352,27 @@ function serveStatic(req, res, urlPath) {
   });
 }
 
+function pipeFile(filePath, res, opts) {
+  const stream = fs.createReadStream(filePath, opts);
+  stream.on('error', (e) => {
+    console.error('[voice-service] read stream error:', filePath, e.message);
+    try { if (!res.headersSent) res.writeHead(500); } catch (e2) { /* ignore */ }
+    try { res.end(); } catch (e2) { /* ignore */ }
+  });
+  res.on('error', () => { try { stream.destroy(); } catch (e2) { /* ignore */ } });
+  res.on('close', () => { if (!stream.destroyed) stream.destroy(); });
+  stream.pipe(res);
+}
+
 function serveRecording(req, res, name, headOnly, baseDir) {
-  const safe = path.basename(decodeURIComponent(name));
+  let safe;
+  try {
+    safe = path.basename(decodeURIComponent(name));
+  } catch (e) {
+    res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('bad request');
+    return;
+  }
   const filePath = path.join(baseDir || REC_DIR, safe);
   fs.stat(filePath, (err, st) => {
     if (err || !st.isFile()) { res.writeHead(404); res.end('not found'); return; }
@@ -352,8 +393,7 @@ function serveRecording(req, res, name, headOnly, baseDir) {
         'Cache-Control': 'no-cache',
       });
       if (headOnly) return res.end();
-      fs.createReadStream(filePath, { start, end }).pipe(res);
-      return;
+      return pipeFile(filePath, res, { start, end });
     }
     res.writeHead(200, {
       'Content-Type': 'audio/wav',
@@ -362,7 +402,7 @@ function serveRecording(req, res, name, headOnly, baseDir) {
       'Cache-Control': 'no-cache',
     });
     if (headOnly) return res.end();
-    fs.createReadStream(filePath).pipe(res);
+    pipeFile(filePath, res);
   });
 }
 
@@ -582,6 +622,20 @@ function startAsr() {
     env: process.env,
   });
   asr.proc = proc;
+  proc.on('error', (e) => {
+    if (asr.proc !== proc) return;
+    console.error('[voice-service] ASR spawn error:', e.message);
+    asr.proc = null;
+    asr.ready = false;
+    asr.error = 'ASR worker: ' + e.message;
+    broadcast('asr', { state: 'error', error: asr.error });
+    if (asr.enabled) setTimeout(() => { if (asr.enabled && !asr.proc) startAsr(); }, 5000);
+  });
+  proc.stdin.on('error', (e) => {
+    // воркер мог умереть: EPIPE приходит асинхронно, try/catch вокруг write его не ловит
+    asr.ready = false;
+    if (asr.proc === proc) asr.error = 'ASR stdin: ' + e.message;
+  });
   proc.stdout.setEncoding('utf8');
   proc.stdout.on('data', (chunk) => {
     asr.buf += chunk;
@@ -1614,7 +1668,7 @@ function respondWithLlm(text) {
 }
 
 /* ---------- HTTP ---------- */
-const server = http.createServer((req, res) => {
+function handleRequest(req, res) {
   const u = new URL(req.url, 'http://' + (req.headers.host || 'localhost'));
   const p = u.pathname;
   const method = req.method || 'GET';
@@ -1644,9 +1698,14 @@ const server = http.createServer((req, res) => {
       if (q && q !== capture.source) stopCapture();
       if (q) capture.source = q;
       resolveSource((src) => {
-        if (!src) return sendJson(res, { error: 'no audio source found (pactl list short sources)' }, 503);
-        startRecording();
-        sendJson(res, { ok: true, name: capture.rec.name, source: src, startedAt: new Date(capture.rec.startedAt).toISOString() });
+        try {
+          if (!src) return sendJson(res, { error: 'no audio source found (pactl list short sources)' }, 503);
+          startRecording();
+          sendJson(res, { ok: true, name: capture.rec.name, source: src, startedAt: new Date(capture.rec.startedAt).toISOString() });
+        } catch (e) {
+          console.error('[voice-service] record start error:', e && (e.stack || e.message || e));
+          try { sendJson(res, { error: 'не удалось начать запись: ' + e.message }, 500); } catch (e2) { /* ignore */ }
+        }
       });
       return;
     }
@@ -2072,6 +2131,18 @@ const server = http.createServer((req, res) => {
     res.writeHead(405); res.end('method not allowed'); return;
   }
   return serveStatic(req, res, p);
+}
+
+const server = http.createServer((req, res) => {
+  try {
+    handleRequest(req, res);
+  } catch (e) {
+    console.error('[voice-service] request error:', req.method, req.url, e && (e.stack || e.message || e));
+    try {
+      if (!res.headersSent) sendJson(res, { error: 'internal error' }, 500);
+      else res.end();
+    } catch (e2) { /* ignore */ }
+  }
 });
 
 server.on('error', (e) => {
